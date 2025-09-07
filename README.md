@@ -1,7 +1,7 @@
 # litepop
 LiTePoP: Linux Terminal Podcast Player
 
-**litepop** is a terminal-based podcast player for Linux. It supports playback control, download queue management, and full synchronization with a [Nextcloud-gPodder](https://github.com/gpodder/mygpo) or a [oPodSync](https://github.com/kd2org/opodsync) server.
+**litepop** is a terminal-based podcast player for Linux. It supports playback control, download queue management, and full synchronization with a [Nextcloud-gPodder](https://github.com/gpodder/mygpo) or an [oPodSync](https://github.com/kd2org/opodsync) server.
 
 Built with `curses` for a clean terminal UI and using `mpv` for audio playback, litepop allows you to manage subscriptions, queue episodes, and sync your listening progress across devices.
 
