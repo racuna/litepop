@@ -49,6 +49,7 @@ class Config:
             "password": "",
             "sync_interval": "300",
             "backend": "opodsync",  # nextcloud or opodsync
+            "initial_days_back ": "90",
             "device_id": "default"
         }
         self.config["player"] = {
