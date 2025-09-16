@@ -64,6 +64,7 @@ password = yourpassword
 backend = opodsync # or nextcloud
 device_id = litepop
 sync_interval = 300
+initial_days_back = 90
 
 [player]
 temp_dir = /tmp/litepop
