@@ -78,6 +78,8 @@ class GPodderSync:
         self.password = config.get("gpodder", "password")
         self.device_id = config.get("gpodder", "device_id")
         self.backend = config.get("gpodder", "backend", "opodsync").lower()
+        
+        self.config = config
 
         self.session = requests.Session()
         self.session.auth = (self.username, self.password)
@@ -159,7 +161,7 @@ class GPodderSync:
             return []
 
     def get_episode_actions(self, since: Optional[datetime] = None) -> Dict:
-        """Get episode actions from server"""
+        """Get episode actions from server with improved parsing"""
         try:
             if self.backend == "nextcloud":
                 url = urljoin(self.server_url, "episode_action")
@@ -169,41 +171,122 @@ class GPodderSync:
                 raise ValueError(f"Unknown backend: {self.backend}")
 
             params = {}
-            if since and self.backend == "opodsync":
-                params["since"] = int(since.timestamp())
+            if self.backend == "opodsync":
+                if since:
+                    # opodsync expects Unix timestamp
+                    params["since"] = int(since.timestamp())
+                else:
+                    # Primera sincronización: limitar a últimos N días (por defecto 90)
+                    try:
+                        days_back = int(self.config.get("gpodder", "initial_days_back", "90"))
+                    except ValueError:
+                        days_back = 90
+                    cutoff = int(datetime.now().timestamp()) - (days_back * 86400)
+                    params["since"] = cutoff
+                    log(f"Using initial sync cutoff: last {days_back} days (since={params['since']})")
 
             log(f"Fetching episode actions from: {url} with params: {params}")
             resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, params=params, timeout=30)
+            
+            # AÑADIR: Mejor logging de la respuesta
+            log(f"Episode actions response status: {resp.status_code}")
+            log(f"Episode actions response headers: {dict(resp.headers)}")
+            log(f"Episode actions response content length: {len(resp.content) if resp.content else 0}")
+            
             resp.raise_for_status()
             
-            if not resp.content:
+            # MEJORAR: Mejor manejo de respuestas vacías
+            if not resp.content or len(resp.content.strip()) == 0:
                 log("Empty response from episode actions endpoint")
-                return {"actions": []}
+                return {"actions": [], "timestamp": int(datetime.now().timestamp())}
             
-            data = resp.json()
-            log(f"Raw episode actions response type: {type(data)}")
-
-            # Handle different response formats
-            if isinstance(data, list):
-                actions = data
-            elif isinstance(data, dict):
+            # AÑADIR: Log del contenido de la respuesta (primeros 200 caracteres)
+            content_preview = resp.text[:200] + "..." if len(resp.text) > 200 else resp.text
+            log(f"Episode actions raw response preview: {content_preview}")
+            
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                log(f"JSON decode error: {str(e)}")
+                log(f"Raw response text: {resp.text}")
+                return {"actions": [], "timestamp": int(datetime.now().timestamp())}
+            
+            log(f"Episode actions parsed JSON type: {type(data)}")
+            
+            # Handle different response formats more robustly
+            actions = []
+            timestamp = int(datetime.now().timestamp())
+            
+            if isinstance(data, dict):
+                # Standard gPodder format
                 if "actions" in data:
                     actions = data.get("actions", [])
+                    timestamp = data.get("timestamp", timestamp)
+                    log(f"Found 'actions' key with {len(actions)} actions")
+                # Some servers return actions directly in dict
+                elif "podcast" in data or "episode" in data:
+                    actions = [data]
+                    log("Found single action in dict format")
+                # Nextcloud format might have different structure
                 else:
-                    actions = []
+                    # Look for any list in the response
+                    for key, value in data.items():
+                        if isinstance(value, list):
+                            actions = value
+                            log(f"Found actions in key '{key}' with {len(actions)} items")
+                            break
+                            
+            elif isinstance(data, list):
+                # Direct list of actions
+                actions = data
+                log(f"Found direct list with {len(actions)} actions")
             else:
+                log(f"Unexpected response format: {type(data)}")
                 actions = []
 
-            log(f"Retrieved {len(actions)} episode actions")
-            self.episode_actions_cache = actions
-            return {"actions": actions}
+            # Validate and clean actions
+            valid_actions = []
+            for i, action in enumerate(actions):
+                if isinstance(action, dict) and "episode" in action and "action" in action:
+                    # Ensure required fields exist
+                    cleaned_action = {
+                        "podcast": action.get("podcast", ""),
+                        "episode": action.get("episode", ""),
+                        "action": action.get("action", "").lower(),
+                        "timestamp": action.get("timestamp", ""),
+                        "device": action.get("device", ""),
+                    }
+                    
+                    # Add optional numeric fields if valid
+                    for field in ["position", "started", "total"]:
+                        if field in action:
+                            try:
+                                value = int(float(action[field])) if action[field] is not None else 0
+                                if value >= 0:
+                                    cleaned_action[field] = value
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Add guid if present and not empty
+                    if action.get("guid") and str(action["guid"]).strip():
+                        cleaned_action["guid"] = str(action["guid"]).strip()
+                    
+                    valid_actions.append(cleaned_action)
+                else:
+                    log(f"Skipping invalid action {i}: {action}")
+
+            log(f"Retrieved {len(valid_actions)} valid episode actions")
+            self.episode_actions_cache = valid_actions
+            return {"actions": valid_actions, "timestamp": timestamp}
             
         except Exception as e:
             log(f"Error retrieving episode actions: {str(e)}")
-            return {"actions": []}
+            import traceback
+            log(f"Full traceback: {traceback.format_exc()}")
+            return {"actions": [], "timestamp": int(datetime.now().timestamp())}
 
     def upload_episode_actions(self, actions: List[Dict]) -> Dict:
-        """Upload episode actions to server"""
+        """Upload episode actions with improved timestamp handling"""
         try:
             if not actions:
                 return {}
@@ -211,48 +294,72 @@ class GPodderSync:
             # Format actions according to backend requirements
             formatted_actions = []
             for action in actions:
-                 # Create base action with required fields
+                # Create base action with required fields
                 formatted_action = {
-                    "podcast": action.get("podcast", ""),
-                    "episode": action.get("episode", ""),
-                    "action": action.get("action", "").lower(),
+                    "podcast": str(action.get("podcast", "")),
+                    "episode": str(action.get("episode", "")),
+                    "action": str(action.get("action", "")).lower(),
                 }
             
-                # Handle timestamp - opodsync might expect Unix timestamp or ISO format
+                # Handle timestamp with multiple format attempts
                 timestamp = action.get("timestamp")
                 if timestamp:
                     try:
-                        # If it's already an ISO string, convert to datetime then to proper format
+                        # Parse various timestamp formats
                         if isinstance(timestamp, str):
-                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            # Try ISO format first
+                            if 'T' in timestamp:
+                                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            # Try Unix timestamp string
+                            elif timestamp.isdigit():
+                                dt = datetime.fromtimestamp(int(timestamp))
+                            else:
+                                # Fallback to current time
+                                dt = datetime.now()
+                        elif isinstance(timestamp, (int, float)):
+                            dt = datetime.fromtimestamp(timestamp)
                         else:
-                            dt = timestamp
+                            dt = datetime.now()
                     
-                        # For opodsync, try ISO format without microseconds
-                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                        # Format timestamp based on backend
+                        if self.backend == "opodsync":
+                            # opodsync prefers ISO format without microseconds and with Z suffix
+                            formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        else:
+                            # Nextcloud format
+                            formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                            
                     except Exception as e:
-                        log(f"Error formatting timestamp: {str(e)}")
-                        formatted_action["timestamp"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        log(f"Error formatting timestamp {timestamp}: {str(e)}")
+                        dt = datetime.now()
+                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ" if self.backend == "opodsync" else "%Y-%m-%dT%H:%M:%S")
                 else:
-                    formatted_action["timestamp"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    dt = datetime.now()
+                    formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ" if self.backend == "opodsync" else "%Y-%m-%dT%H:%M:%S")
             
                 # Add device field for opodsync (required)
                 if self.backend == "opodsync":
                     formatted_action["device"] = self.device_id
             
                 # Add optional fields if present and valid
-                if "position" in action and action["position"] is not None and action["position"] >= 0:
-                    formatted_action["position"] = int(action["position"])
-            
-                if "started" in action and action["started"] is not None and action["started"] >= 0:
-                    formatted_action["started"] = int(action["started"])
-            
-                if "total" in action and action["total"] is not None and action["total"] > 0:
-                    formatted_action["total"] = int(action["total"])
+                for field in ["position", "started", "total"]:
+                    if field in action and action[field] is not None:
+                        try:
+                            value = int(float(action[field]))
+                            if field == "total":
+                                if value > 0:
+                                    formatted_action[field] = value
+                                else:
+                                    if value >= 0:
+                                        formatted_action[field] = value
+                            elif value >= 0:
+                                formatted_action[field] = value
+                        except (ValueError, TypeError):
+                            pass
             
                 # Only add guid if it's not empty
-                if "guid" in action and action["guid"] and action["guid"].strip():
-                    formatted_action["guid"] = action["guid"].strip()
+                if "guid" in action and action["guid"] and str(action["guid"]).strip():
+                    formatted_action["guid"] = str(action["guid"]).strip()
             
                 formatted_actions.append(formatted_action)
 
@@ -265,11 +372,11 @@ class GPodderSync:
                 raise ValueError(f"Unknown backend: {self.backend}")
 
             log(f"Uploading {len(formatted_actions)} episode actions to: {url}")
-            log(f"Actions payload: {json.dumps(formatted_actions, indent=2)}")
+            log(f"Sample action: {json.dumps(formatted_actions[0] if formatted_actions else {}, indent=2)}")
         
             # Prepare headers
             headers = {
-                "User-Agent": "litepod/1.0",
+                "User-Agent": "litepop/1.0",
                 "Content-Type": "application/json",
                 "Accept": "application/json"
             }
@@ -278,43 +385,44 @@ class GPodderSync:
             resp = self.session.post(
                 url,
                 headers=headers,
-                json=formatted_actions,  # Use json parameter instead of data
+                json=formatted_actions,
                 timeout=30,
             )
         
             log(f"Episode actions upload response status: {resp.status_code}")
-            log(f"Episode actions upload response headers: {dict(resp.headers)}")
         
             # Log response content for debugging
             if resp.content:
                 try:
-                    log(f"Episode actions upload response content: {resp.text}")
+                    response_text = resp.text[:500] + "..." if len(resp.text) > 500 else resp.text
+                    log(f"Episode actions upload response: {response_text}")
                 except:
-                    log(f"Episode actions upload response content (bytes): {resp.content}")
+                    log(f"Episode actions upload response (bytes): {resp.content[:200]}...")
         
             resp.raise_for_status()
         
-            if not resp.content:
-                log("Episode actions uploaded successfully (empty response)")
-                return {}
-        
-            try:
-                result = resp.json()
-                log(f"Episode actions upload response: {result}")
-                return result
-            except ValueError:
-                log("Episode actions uploaded successfully (non-JSON response)")
-                return {}
+            # Parse response if present
+            if resp.content:
+                try:
+                    result = resp.json()
+                    return result
+                except ValueError:
+                    return {"status": "success"}
+            else:
+                return {"status": "success"}
             
         except requests.exceptions.HTTPError as e:
             log(f"HTTP error uploading episode actions: {str(e)}")
             if hasattr(e, 'response') and e.response is not None:
                 log(f"Response status: {e.response.status_code}")
-                log(f"Response content: {e.response.text}")
-            return {}
+                try:
+                    log(f"Response content: {e.response.text}")
+                except:
+                    log(f"Response content (bytes): {e.response.content}")
+            return {"error": str(e)}
         except Exception as e:
             log(f"Error uploading episode actions: {str(e)}")
-            return {}
+            return {"error": str(e)}
 
 class PodcastFeed:
     """Represents a podcast feed with episodes"""
@@ -735,7 +843,7 @@ class Litepop:
                             "timestamp": datetime.now().isoformat(),
                             "position": position,
                             "started": 0,
-                            "total": int(duration) if duration > 0 else -1,
+                            "total": int(duration) if duration and duration > 0 else 0,
                             "guid": episode.guid
                         }
                         log(f"Syncing position: {episode.title} at {position}s")
@@ -760,24 +868,94 @@ class Litepop:
 
     def _playback_monitor(self) -> None:
         """Monitors playback status and auto-plays next episode"""
+        consecutive_end_checks = 0  # Counter for consecutive end-of-file checks
+        last_position = 0
+        position_stuck_count = 0
+    
         while self.running:
-            if self.player.process and self.player.process.poll() is not None:
-                self.player.playing = False
-                if self.current_index >= 0 and self.current_index < len(self.queue):
+            try:
+                if self.player.playing and self.current_index >= 0 and self.current_index < len(self.queue):
                     episode = self.queue[self.current_index]
                     duration = self.player.get_duration()
                     position = self.player.get_position()
-                
-                    if (duration and position >= duration * 0.95) or (not duration and position > 0):
-                        self.mark_episode_completed(episode)
-                        self.set_status_message(f"Completed: {episode.title}")
-                    
-                        if self.current_index + 1 < len(self.queue):
-                            threading.Timer(0.5, lambda: self.play_selected(self.current_index + 1)).start()
+
+                    # Multiple completion detection methods
+                    episode_completed = False
+                    completion_reason = ""
+
+                    # Method 1: Position-based completion (99% threshold)
+                    if duration > 0 and position > 0:
+                        progress_percentage = (position / duration) * 100
+                        if progress_percentage >= 99.0:
+                            episode_completed = True
+                            completion_reason = f"99% threshold reached ({progress_percentage:.1f}%)"
+
+                    # Method 2: Position >= duration (original method)
+                    if duration > 0 and position >= duration:
+                        episode_completed = True
+                        completion_reason = f"Position >= duration ({position:.1f}/{duration:.1f})"
+
+                    # Method 3: Position stuck at end for multiple checks
+                    if duration > 0 and position > 0:
+                        if abs(position - last_position) < 0.5 and position >= (duration * 0.98):
+                            position_stuck_count += 1
+                            if position_stuck_count >= 4:  # 2 seconds of being stuck at ~end
+                                episode_completed = True
+                                completion_reason = f"Position stuck at end ({position:.1f}/{duration:.1f})"
                         else:
-                            self.set_status_message("Queue completed!")
+                            position_stuck_count = 0
+                        last_position = position
+
+                    # Method 4: Process terminated and we were near the end
+                    if self.player.process and self.player.process.poll() is not None:
+                        if duration > 0 and position >= (duration * 0.95):
+                            episode_completed = True
+                            completion_reason = f"Process ended near completion ({position:.1f}/{duration:.1f})"
+                        else:
+                            # Process ended unexpectedly (not at end)
+                            log(f"MPV process terminated unexpectedly at {position:.1f}s of {duration:.1f}s")
+                            self.player.playing = False
+                            consecutive_end_checks = 0
+                            position_stuck_count = 0
+                            time.sleep(0.5)
+                            continue
+
+                    # If episode completed by any method
+                    if episode_completed:
+                        consecutive_end_checks += 1
+                        log(f"Episode completion detected: {completion_reason} (check #{consecutive_end_checks})")
+                    
+                        # Require 2 consecutive checks to avoid false positives
+                        if consecutive_end_checks >= 2:
+                            log(f"Confirming episode completion: {episode.title}")
+                            self.player.stop()  # Force stop mpv to release resources
+                            self.mark_episode_completed(episode)
+                            self.set_status_message(f"Completed: {episode.title}")
+
+                            # Reset counters
+                            consecutive_end_checks = 0
+                            position_stuck_count = 0
+
+                            # Auto-play next episode after a brief pause
+                            if self.current_index + 1 < len(self.queue):
+                                threading.Timer(1.5, lambda: self.play_selected(self.current_index + 1)).start()
+                            else:
+                                self.set_status_message("Queue completed!")
                     else:
-                        self._sync_episode_position(episode)
+                        consecutive_end_checks = 0
+
+                # Check if the player process has terminated unexpectedly (when not near end)
+                elif self.player.process and self.player.process.poll() is not None and self.player.playing:
+                    log("MPV process terminated unexpectedly (not playing).")
+                    self.player.playing = False
+                    consecutive_end_checks = 0
+                    position_stuck_count = 0
+
+            except Exception as e:
+                log(f"Error in playback monitor: {str(e)}")
+                consecutive_end_checks = 0
+                position_stuck_count = 0
+
             time.sleep(0.5)
 
     def _sync_with_gpodder(self) -> bool:
@@ -849,32 +1027,53 @@ class Litepop:
         """Updates episode actions cache"""
         for action in actions:
             episode_url = action.get("episode")
-            if episode_url:
-                self.episode_actions_cache.setdefault(episode_url, {
+            if not episode_url:
+                continue
+                
+            # Initialize cache entry if doesn't exist
+            if episode_url not in self.episode_actions_cache:  # CAMBIAR: litepop_instance. -> self.
+                self.episode_actions_cache[episode_url] = {  # CAMBIAR: litepop_instance. -> self.
                     "progress": 0.0,
                     "position": 0,
                     "total": -1,
-                    "server_completed": False
-                })
+                    "server_completed": False,
+                    "last_action": "unknown",
+                    "last_timestamp": ""
+                }
                 
-                action_type = action.get("action", "").lower()
-                if action_type == "play":
-                    position = action.get("position", 0)
-                    total = action.get("total", -1)
-                    progress = (position / total) * 100 if total > 0 else 0.0
-                    self.episode_actions_cache[episode_url].update({
-                        "position": position,
-                        "total": total,
-                        "progress": progress,
-                        "server_completed": progress > 95.0
-                    })
-                elif action_type == "download":
-                    self.episode_actions_cache[episode_url].update({
-                        "server_completed": True,
-                        "progress": 100.0
-                    })
+            cache_entry = self.episode_actions_cache[episode_url]  # CAMBIAR: litepop_instance. -> self.
+            action_type = action.get("action", "").lower()
+            timestamp = action.get("timestamp", "")
+            
+            # Update last action info
+            cache_entry["last_action"] = action_type
+            cache_entry["last_timestamp"] = timestamp
+            
+            if action_type == "play":
+                position = int(action.get("position", 0))
+                total = int(action.get("total", -1))
                 
-                log(f"Updated cache for {episode_url}: {self.episode_actions_cache[episode_url]}")
+                # Only update if we have valid data
+                if position > 0:
+                    cache_entry["position"] = max(cache_entry["position"], position)
+                    
+                if total > 0:
+                    cache_entry["total"] = total
+                    # Calculate progress percentage
+                    progress = (cache_entry["position"] / total) * 100
+                    cache_entry["progress"] = min(progress, 100.0)
+                    
+                    # Mark as completed if >95%
+                    if progress > 95.0:
+                        cache_entry["server_completed"] = True
+                        cache_entry["progress"] = 100.0
+                        
+            elif action_type == "download":
+                # Download action means episode was completed
+                cache_entry["server_completed"] = True
+                cache_entry["progress"] = 100.0
+                
+            log(f"Updated cache for {episode_url}: pos={cache_entry['position']}, progress={cache_entry['progress']:.1f}%, completed={cache_entry['server_completed']}")
 
     def _get_episode_server_status(self, episode_url: str) -> Dict:
         """Gets episode status from cache"""
@@ -890,19 +1089,31 @@ class Litepop:
         log("Loading auto queue from episode actions")
         
         # Update existing queue items with server status
-        for episode in self.queue:
-            server_status = self._get_episode_server_status(episode.url)
+        for episode in self.queue:  # CAMBIAR: litepop_instance.queue -> self.queue
+            server_status = self._get_episode_server_status(episode.url)  # CAMBIAR: litepop_instance._get... -> self._get...
             episode.server_completed = server_status["server_completed"]
             episode.position = max(episode.position, server_status["position"])
             episode.progress = max(episode.progress, server_status["progress"])
 
-        # Add partially played episodes that aren't in queue yet
-        for episode_url, cache_data in self.episode_actions_cache.items():
+        # Find episodes to add to queue with more flexible criteria
+        episodes_added = 0
+        for episode_url, cache_data in self.episode_actions_cache.items():  # CAMBIAR: litepop_instance.episode... -> self.episode...
             progress = cache_data.get("progress", 0.0)
-            if 1 <= progress < 95 and not any(ep.url == episode_url for ep in self.queue):
+            position = cache_data.get("position", 0)
+            is_completed = cache_data.get("server_completed", False)
+            
+            # Add episodes that:
+            # 1. Have some progress (position > 30s) but aren't completed
+            # 2. OR have 1-98% progress
+            should_add = (
+                (position > 30 and not is_completed) or 
+                (1 <= progress < 98)
+            ) and not any(ep.url == episode_url for ep in self.queue)  # CAMBIAR: litepop_instance.queue -> self.queue
+            
+            if should_add:
                 # Find the episode in our feeds
                 found_episode = None
-                for feed in self.subscriptions:
+                for feed in self.subscriptions:  # CAMBIAR: litepop_instance.subscriptions -> self.subscriptions
                     for episode_data in feed.episodes:
                         if episode_data["url"] == episode_url:
                             found_episode = episode_data
@@ -911,13 +1122,21 @@ class Litepop:
                         break
                 
                 if found_episode:
-                    episode = Episode(found_episode)
+                    episode = Episode(found_episode)  # REMOVER: "from litepop import Episode" - ya está definido arriba
                     episode.progress = progress
-                    episode.position = cache_data.get("position", 0)
-                    episode.server_completed = cache_data.get("server_completed", False)
-                    self.queue.append(episode)
-                    self.download_manager.download_episode(episode)
-                    log(f"Added partially played episode to queue: {episode.title}")
+                    episode.position = position
+                    episode.server_completed = is_completed
+                    self.queue.append(episode)  # CAMBIAR: litepop_instance.queue -> self.queue
+                    self.download_manager.download_episode(episode)  # CAMBIAR: litepop_instance.download_manager -> self.download_manager
+                    episodes_added += 1
+                    log(f"Added episode to queue: {episode.title} (progress: {progress:.1f}%, position: {position}s)")
+                else:
+                    log(f"Could not find episode in feeds: {episode_url}")
+        
+        if episodes_added > 0:
+            log(f"Added {episodes_added} episodes to auto queue")
+        else:
+            log("No episodes added to auto queue")
 
     def _get_pending_actions(self) -> List[Dict]:
         """Gets pending episode actions for upload"""
