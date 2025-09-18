@@ -887,9 +887,9 @@ class Litepop:
                     # Method 1: Position-based completion (99% threshold)
                     if duration > 0 and position > 0:
                         progress_percentage = (position / duration) * 100
-                        if progress_percentage >= 99.0:
+                        if progress_percentage >= 99.9:
                             episode_completed = True
-                            completion_reason = f"99% threshold reached ({progress_percentage:.1f}%)"
+                            completion_reason = f"99.9% threshold reached ({progress_percentage:.1f}%)"
 
                     # Method 2: Position >= duration (original method)
                     if duration > 0 and position >= duration:
