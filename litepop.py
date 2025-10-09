@@ -22,9 +22,21 @@ from urllib.parse import urljoin
 from typing import List, Dict, Optional
 from pathlib import Path
 
-def log(msg: str) -> None:
+def log(msg: str, log_file: Optional[str] = None) -> None:
     """Global logging function"""
-    with open("/tmp/litepop_debug.log", "a") as f:
+    if log_file is None:
+        # Usar archivo desde la configuración si existe
+        config_path = Path.home() / ".config" / "litepop.conf"
+        if config_path.exists():
+            cfg = configparser.ConfigParser()
+            cfg.read(config_path)
+            log_file = cfg.get("player", "log_file", fallback="/tmp/litepop_debug.log")
+        else:
+            log_file = "/tmp/litepop_debug.log"
+    
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as f:
         f.write(f"{datetime.now()}: {msg}\n")
 
 class Config:
@@ -54,6 +66,7 @@ class Config:
         }
         self.config["player"] = {
             "temp_dir": "/tmp/litepop",
+            "log_file": "/tmp/litepop/litepop_debug.log",
             "default_speed": "1.0",
             "player_command": "mpv --no-config --no-video --af=loudnorm=i=-16:lra=11:tp=-1.5 --speed={speed} --start={start_time} --input-ipc-server={ipc_socket} {file}"
         }
@@ -765,8 +778,11 @@ class Litepop:
     """Main application class for litepop"""
     def __init__(self):
         self.config = Config()
-        Path("/tmp/litepop_debug.log").write_text("")
-        log("Starting Litepop application")
+        self.log_file = self.config.get("player", "log_file", "/tmp/litepop/litepop_debug.log")
+        log_path = Path(self.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("")
+        log("Starting Litepop application", self.log_file)
         self.gpodder = GPodderSync(self.config)
         self.download_manager = DownloadManager(self.config.get("player", "temp_dir", "/tmp/litepop"))
         self.player = Player(self.config)
@@ -817,7 +833,7 @@ class Litepop:
 
     def _log_monitor(self) -> None:
         """Monitors log file for last line"""
-        log_file = Path("/tmp/litepop_debug.log")
+        log_file = Path(self.log_file)
         while self.running:
             try:
                 if log_file.exists():
@@ -887,9 +903,9 @@ class Litepop:
                     # Method 1: Position-based completion (99% threshold)
                     if duration > 0 and position > 0:
                         progress_percentage = (position / duration) * 100
-                        if progress_percentage >= 99.9:
+                        if progress_percentage >= 99.99:
                             episode_completed = True
-                            completion_reason = f"99.9% threshold reached ({progress_percentage:.1f}%)"
+                            completion_reason = f"99.99% threshold reached ({progress_percentage:.1f}%)"
 
                     # Method 2: Position >= duration (original method)
                     if duration > 0 and position >= duration:
@@ -1383,9 +1399,13 @@ class Litepop:
                     self.stdscr.attroff(curses.A_BOLD)
                 else:
                     episode = item['episode']
-                    title = episode.title[:width-10] + "..." if len(episode.title) > width-10 else episode.title
+                    
+                    # MODIFICACIÓN: Agregar tick si el episodio está completado
+                    status_icon = "✓ " if episode.server_completed else "  "
+                    
+                    title = episode.title[:width-12] + "..." if len(episode.title) > width-12 else episode.title
                     dur_str = self.player.format_time(episode.duration) if episode.duration else "??:??:??"
-                    line = f"  {title} - {episode.podcast_title} [{dur_str}] [{episode.progress:.1f}%]"
+                    line = f"{status_icon}{title} - {episode.podcast_title} [{dur_str}] [{episode.progress:.1f}%]"
                     
                     if episode.server_completed:
                         self.stdscr.attron(curses.color_pair(8))
