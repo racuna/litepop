@@ -550,6 +550,7 @@ class DownloadManager:
         self.temp_dir = Path(temp_dir)
         self.max_concurrent = max_concurrent
         self.downloads = {}
+        self.failed_downloads = {}  # NUEVO: Trackear descargas fallidas
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
 
@@ -558,40 +559,122 @@ class DownloadManager:
         url_hash = hashlib.md5(episode.url.encode()).hexdigest()
         return str(self.temp_dir / f"{url_hash}.mp3")
 
-    def download_episode(self, episode: Episode, callback: Optional[callable] = None) -> None:
-        """Downloads episode if not already downloaded"""
+    def is_downloading(self, episode: Episode) -> bool:
+        """Check if episode is currently downloading"""
         with self.lock:
-            if episode.url in self.downloads:
-                return
+            return episode.url in self.downloads
+
+    def is_downloaded(self, episode: Episode) -> bool:
+        """Check if episode file exists"""
+        filename = self.get_episode_filename(episode)
+        return Path(filename).exists()
+
+    def download_episode(self, episode: Episode, callback: Optional[callable] = None, force: bool = False) -> bool:
+        """Downloads episode if not already downloaded
+        
+        Args:
+            episode: Episode to download
+            callback: Optional callback when download completes
+            force: Force redownload even if file exists
+            
+        Returns:
+            True if download started or file exists, False if already downloading
+        """
+        with self.lock:
             filename = self.get_episode_filename(episode)
-            if Path(filename).exists():
+            
+            # Si ya existe el archivo y no forzamos redownload
+            if not force and Path(filename).exists():
                 episode.local_file = filename
-                return
+                episode.downloading = False
+                return True
+            
+            # Si ya está descargando
+            if episode.url in self.downloads:
+                log(f"Episode already downloading: {episode.title}")
+                return False
+            
+            # Iniciar descarga
             episode.downloading = True
-            self.downloads[episode.url] = threading.Thread(target=self._download_worker, args=(episode, filename, callback))
+            episode.local_file = None
+            
+            # Limpiar del registro de fallos si existía
+            if episode.url in self.failed_downloads:
+                del self.failed_downloads[episode.url]
+            
+            self.downloads[episode.url] = threading.Thread(
+                target=self._download_worker, 
+                args=(episode, filename, callback)
+            )
             self.downloads[episode.url].daemon = True
             self.downloads[episode.url].start()
+            log(f"Started download: {episode.title}")
+            return True
 
     def _download_worker(self, episode: Episode, filename: str, callback: Optional[callable]) -> None:
         """Worker function for downloading episodes"""
         try:
-            log(f"Starting download: {episode.title}")
-            response = requests.get(episode.url, stream=True, timeout=30, headers={"User-Agent": "litepop/1.0"})
+            log(f"Downloading: {episode.title} from {episode.url}")
+            response = requests.get(
+                episode.url, 
+                stream=True, 
+                timeout=30, 
+                headers={"User-Agent": "litepop/1.0"}
+            )
             response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
             with open(filename, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            episode.progress = (downloaded / total_size) * 100
+            
             episode.local_file = filename
+            episode.downloading = False
             log(f"Download completed: {episode.title}")
+            
             if callback:
                 callback(episode)
+                
         except Exception as e:
-            log(f"Error downloading {episode.url}: {str(e)}")
+            error_msg = str(e)
+            log(f"Error downloading {episode.url}: {error_msg}")
+            
+            # Registrar el fallo
+            with self.lock:
+                self.failed_downloads[episode.url] = {
+                    "error": error_msg,
+                    "timestamp": datetime.now(),
+                    "attempts": self.failed_downloads.get(episode.url, {}).get("attempts", 0) + 1
+                }
+            
+            # Limpiar archivo parcial si existe
+            try:
+                if Path(filename).exists():
+                    Path(filename).unlink()
+            except:
+                pass
+                
         finally:
             with self.lock:
                 episode.downloading = False
                 if episode.url in self.downloads:
                     del self.downloads[episode.url]
+
+    def get_download_error(self, episode: Episode) -> Optional[str]:
+        """Get error message for failed download"""
+        with self.lock:
+            if episode.url in self.failed_downloads:
+                failure_info = self.failed_downloads[episode.url]
+                attempts = failure_info.get("attempts", 1)
+                error = failure_info.get("error", "Unknown error")
+                return f"Download failed ({attempts} attempts): {error}"
+        return None
 
     def cleanup_file(self, filename: str) -> None:
         """Removes specified file if it exists"""
@@ -903,9 +986,9 @@ class Litepop:
                     # Method 1: Position-based completion (99% threshold)
                     if duration > 0 and position > 0:
                         progress_percentage = (position / duration) * 100
-                        if progress_percentage >= 99.99:
+                        if progress_percentage >= 99.98 or duration - position < 1.5:
                             episode_completed = True
-                            completion_reason = f"99.99% threshold reached ({progress_percentage:.1f}%)"
+                            completion_reason = f"99.98% threshold reached ({progress_percentage:.1f}%)"
 
                     # Method 2: Position >= duration (original method)
                     if duration > 0 and position >= duration:
@@ -914,7 +997,8 @@ class Litepop:
 
                     # Method 3: Position stuck at end for multiple checks
                     if duration > 0 and position > 0:
-                        if abs(position - last_position) < 0.5 and position >= (duration * 0.98):
+                        poll_interval = 0.5  # o el valor que uses en tu loop
+                        if abs(position - last_position) < (poll_interval * 0.4) and position >= (duration * 0.98):
                             position_stuck_count += 1
                             if position_stuck_count >= 4:  # 2 seconds of being stuck at ~end
                                 episode_completed = True
@@ -1255,89 +1339,178 @@ class Litepop:
     def draw_queue(self, selected_index: int = 0) -> None:
         """Draws playback queue UI"""
         with self.ui_refresh_lock:
-            self.stdscr.clear()
-            self.draw_header()
-            height, width = self.stdscr.getmaxyx()
-            
-            # Status line
-            status = "Stopped"
-            if self.player.playing and 0 <= self.current_index < len(self.queue):
-                episode = self.queue[self.current_index]
-                pos_str = self.player.format_time(self.player.get_position())
-                dur_str = self.player.format_time(self.player.get_duration())
-                title = episode.title[:max(25, width - 50)]
-                if len(episode.title) > max(25, width - 50):
-                    title += "..."
-                status = f"Playing: {title} (x{self.player.speed}) ({pos_str}/{dur_str})"
+            try:
+                self.stdscr.clear()
+                self.draw_header()
+                height, width = self.stdscr.getmaxyx()
+                
+                # Status line
+                status = "Stopped"
+                if self.player.playing and 0 <= self.current_index < len(self.queue):
+                    episode = self.queue[self.current_index]
+                    pos_str = self.player.format_time(self.player.get_position())
+                    dur_str = self.player.format_time(self.player.get_duration())
+                    title = episode.title[:max(25, width - 50)]
+                    if len(episode.title) > max(25, width - 50):
+                        title += "..."
+                    status = f"Playing: {title} (x{self.player.speed}) ({pos_str}/{dur_str})"
 
-            self.stdscr.addstr(2, 2, f"Status: {status}")
-            
-            # Backend info
-            backend_info = f"Backend: {self.gpodder.backend} | Device: {self.gpodder.device_id}"
-            sync_status = f"Subscriptions: {len(self.subscriptions)} | Last sync: {self.last_sync.strftime('%H:%M') if self.last_sync else 'Never'}"
-            self.stdscr.addstr(3, 2, f"{backend_info} | {sync_status}")
-            
-            start_row = 5
-            visible_items = height - 11
+                self.stdscr.addstr(2, 2, f"Status: {status}"[:width-4])
+                
+                # Backend info
+                backend_info = f"Backend: {self.gpodder.backend} | Device: {self.gpodder.device_id}"
+                sync_status = f"Subscriptions: {len(self.subscriptions)} | Last sync: {self.last_sync.strftime('%H:%M') if self.last_sync else 'Never'}"
+                self.stdscr.addstr(3, 2, f"{backend_info} | {sync_status}"[:width-4])
+                
+                start_row = 5
+                visible_items = height - 11
 
-            if not self.queue:
-                self.stdscr.addstr(start_row, 2, "Queue empty. Press 'a' to add episodes.")
-                if not self.subscriptions:
-                    self.stdscr.addstr(start_row + 1, 2, "No subscriptions. Check gPodder config.")
-            else:
-                for i, episode in enumerate(self.queue[selected_index:selected_index + visible_items]):
-                    row = start_row + i
-                    actual_index = selected_index + i
-                    title = episode.title[:width-30] + "..." if len(episode.title) > width-30 else episode.title
+                if not self.queue:
+                    self.stdscr.addstr(start_row, 2, "Queue empty. Press 'a' to add episodes.")
+                    if not self.subscriptions:
+                        self.stdscr.addstr(start_row + 1, 2, "No subscriptions. Check gPodder config.")
+                else:
+                    # Calculate scroll offset to keep selected item visible
+                    scroll_offset = max(0, min(selected_index - visible_items // 2, len(self.queue) - visible_items))
+                    if scroll_offset < 0:
+                        scroll_offset = 0
                     
-                    # Status icons and colors
-                    status_icon = " "
-                    color_pair = 0
-                    if episode.downloading:
-                        status_icon, color_pair = "↓", 4
-                    elif episode.completed or episode.server_completed:
-                        status_icon, color_pair = "✓", 6
-                    elif actual_index == self.current_index:
-                        status_icon = "♪" if self.player.playing else "II"
-                        color_pair = 3
+                    # Get slice of queue to display
+                    display_slice = self.queue[scroll_offset:scroll_offset + visible_items]
+                    
+                    for i, episode in enumerate(display_slice):
+                        row = start_row + i
+                        actual_index = scroll_offset + i
+                        
+                        # Calculate available space for components
+                        # Format: [STATUS] Title... [Duration] [Progress%]
+                        status_width = 6  # "[XXX] "
+                        duration_width = 11  # " [HH:MM:SS]"
+                        progress_width = 7  # " [XXX%]"
+                        reserved_width = status_width + duration_width + progress_width + 4  # +4 for margins
+                        
+                        available_title_width = width - reserved_width
+                        if available_title_width < 20:
+                            available_title_width = 20
+                        
+                        # Truncate title to fit
+                        title = episode.title[:available_title_width]
+                        if len(episode.title) > available_title_width:
+                            title = title[:available_title_width-3] + "..."
+                        
+                        # Status icon and color
+                        status_icon = "   "
+                        color_pair = 0
+                        
+                        # Determine status
+                        if episode.downloading:
+                            if hasattr(episode, 'progress') and episode.progress > 0:
+                                status_icon = f"D{int(episode.progress):2d}"
+                            else:
+                                status_icon = "DWN"
+                            color_pair = 4  # Yellow
+                        elif episode.completed or episode.server_completed:
+                            # Mostrar como completado aunque el archivo ya se haya limpiado
+                            status_icon = "DON"
+                            color_pair = 8  # Gray/dimmed
+                        elif not self.download_manager.is_downloaded(episode):
+                            error = self.download_manager.get_download_error(episode)
+                            if error:
+                                status_icon = "ERR"
+                                color_pair = 5  # Red
+                            else:
+                                status_icon = "PND"  # Pending
+                                color_pair = 4  # Yellow
+                        elif actual_index == self.current_index:
+                            status_icon = ">>>" if self.player.playing else "II "
+                            color_pair = 3  # Green
+                        else:
+                            status_icon = "   "
 
-                    if color_pair:
-                        self.stdscr.attron(curses.color_pair(color_pair))
-                    if actual_index == selected_index:
-                        self.stdscr.attron(curses.color_pair(2))
-                    
-                    line = f"{status_icon} {title} - {episode.podcast_title} [{episode.progress:.1f}%]"
-                    if actual_index == selected_index and actual_index != self.current_index:
-                        line += " ←"
-                    
-                    self.stdscr.addstr(row, 2, line[:width-4])
-                    
-                    if actual_index == selected_index:
-                        self.stdscr.attroff(curses.color_pair(2))
-                    if color_pair:
-                        self.stdscr.attroff(curses.color_pair(color_pair))
+                        
+                        # Duration
+                        duration_str = ""
+                        if episode.duration and episode.duration > 0:
+                            duration_str = f" [{self.player.format_time(episode.duration)}]"
+                        else:
+                            duration_str = " [--:--:--]"
+                        
+                        # Progress percentage
+                        # Progress percentage (playback progress from server, NOT download progress)
+                        progress_str = ""
+                        server_status = self._get_episode_server_status(episode.url)
+                        server_progress = server_status.get("progress", 0.0)
+                        server_completed = server_status.get("server_completed", False)
 
-            # Help text
-            help_lines = [
-                f"SPACE:Play/Pause/Switch | ENTER:Next | ←→:±10s | d:Delete | D:Delete/Mark done | a:Add | s:Speed({self.player.speed}x) | R:Reset Progress",
-                "c:Clear completed | r:Sync now | ESC/q:Exit | ♪:Playing II:Paused ←:Selected"
-            ]
-            for i, line in enumerate(help_lines):
-                self.stdscr.addstr(height - 4 + i, 2, line[:width-4])
-            
-            # Log line
-            if self.last_log_line:
-                self.stdscr.attron(curses.color_pair(7))
-                self.stdscr.addstr(height - 2, 2, f"Log: {self.last_log_line}"[:width-4])
-                self.stdscr.attroff(curses.color_pair(7))
-            
-            # Status message
-            if self.status_message and time.time() < self.status_timeout:
-                self.stdscr.attron(curses.color_pair(5))
-                self.stdscr.addstr(height - 5, 2, self.status_message[:width-4])
-                self.stdscr.attroff(curses.color_pair(5))
-            
-            self.stdscr.refresh()
+                        # Always show playback progress, never download progress
+                        if server_completed or episode.server_completed or episode.completed:
+                            progress_str = " [100%]"
+                        elif server_progress > 0:
+                            progress_str = f" [{int(server_progress):3d}%]"
+                        elif episode.position > 0 and episode.duration and episode.duration > 0:
+                            progress_pct = (episode.position / episode.duration) * 100
+                            progress_str = f" [{int(progress_pct):3d}%]"
+                        else:
+                            progress_str = " [  0%]"
+                        
+                        # Build the line with proper spacing
+                        line = f"[{status_icon}] {title:<{available_title_width}}{duration_str}{progress_str}"
+                        
+                        # Make sure we don't exceed screen width
+                        max_len = width - 4
+                        if len(line) > max_len:
+                            line = line[:max_len]
+                        
+                        try:
+                            # Apply colors and draw
+                            if actual_index == selected_index:
+                                # Selected item - reverse video
+                                self.stdscr.attron(curses.A_REVERSE)
+                                self.stdscr.addstr(row, 2, line)
+                                self.stdscr.attroff(curses.A_REVERSE)
+                            elif color_pair > 0:
+                                self.stdscr.attron(curses.color_pair(color_pair))
+                                self.stdscr.addstr(row, 2, line)
+                                self.stdscr.attroff(curses.color_pair(color_pair))
+                            else:
+                                self.stdscr.addstr(row, 2, line)
+                        except Exception as e:
+                            log(f"Error drawing line at row {row}: {str(e)}")
+
+                # Help text
+                help_row = height - 4
+                help_lines = [
+                    f"SPACE:Play/Pause | ENTER:Next | </>:Seek | d:Del | D:Del+Done | a:Add | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
+                    "Status: [>>>]=Playing [II]=Paused [DWN]=Downloading [PND]=Pending [DON]=Done [ERR]=Error"
+                ]
+                for i, line in enumerate(help_lines):
+                    try:
+                        self.stdscr.addstr(help_row + i, 2, line[:width-4])
+                    except:
+                        pass
+                
+                # Log line
+                if self.last_log_line:
+                    try:
+                        self.stdscr.attron(curses.color_pair(7))
+                        self.stdscr.addstr(height - 2, 2, f"Log: {self.last_log_line}"[:width-4])
+                        self.stdscr.attroff(curses.color_pair(7))
+                    except:
+                        pass
+                
+                # Status message
+                if self.status_message and time.time() < self.status_timeout:
+                    try:
+                        self.stdscr.attron(curses.color_pair(5))
+                        self.stdscr.addstr(height - 5, 2, self.status_message[:width-4])
+                        self.stdscr.attroff(curses.color_pair(5))
+                    except:
+                        pass
+                
+                self.stdscr.refresh()
+                
+            except Exception as e:
+                log(f"Error in draw_queue: {str(e)}")
 
     def add_episodes_screen(self) -> None:
         """Displays screen for adding episodes"""
@@ -1348,7 +1521,7 @@ class Litepop:
         height, width = self.stdscr.getmaxyx()
         selected = 0
         all_episodes = []
-        
+    
         # Collect all episodes not already in queue
         for feed in self.subscriptions:
             for episode in feed.episodes:
@@ -1362,7 +1535,7 @@ class Litepop:
 
         # Sort by publication date
         all_episodes.sort(key=lambda ep: email.utils.parsedate_to_datetime(ep.pub_date).timestamp() if ep.pub_date else 0, reverse=True)
-        
+
         # Group by date for display
         display_items = []
         current_date = None
@@ -1400,24 +1573,67 @@ class Litepop:
                 else:
                     episode = item['episode']
                     
-                    # MODIFICACIÓN: Agregar tick si el episodio está completado
+                    # Calculate fixed column widths
+                    status_width = 2      # "✓ " or "  "
+                    duration_width = 11   # " [HH:MM:SS]"
+                    progress_width = 7    # " [XXX%]"
+                    podcast_min_width = 25  # Minimum space for podcast name
+                    separator_width = 3   # " - "
+                    reserved_width = status_width + duration_width + progress_width + podcast_min_width + separator_width + 4  # +4 for margins
+                    
+                    available_title_width = width - reserved_width
+                    if available_title_width < 20:
+                        available_title_width = 20
+                    
+                    # Status icon (completed or not)
                     status_icon = "✓ " if episode.server_completed else "  "
                     
-                    title = episode.title[:width-12] + "..." if len(episode.title) > width-12 else episode.title
+                    # Truncate title to fit available space
+                    title = episode.title[:available_title_width]
+                    if len(episode.title) > available_title_width:
+                        title = title[:available_title_width-3] + "..."
+                    
+                    # Truncate podcast name
+                    podcast_name = episode.podcast_title[:podcast_min_width]
+                    if len(episode.podcast_title) > podcast_min_width:
+                        podcast_name = podcast_name[:podcast_min_width-3] + "..."
+                    
+                    # Duration string (fixed width)
                     dur_str = self.player.format_time(episode.duration) if episode.duration else "??:??:??"
-                    line = f"{status_icon}{title} - {episode.podcast_title} [{dur_str}] [{episode.progress:.1f}%]"
+                    duration_str = f"[{dur_str}]"
                     
+                    # Progress string (fixed width)
                     if episode.server_completed:
-                        self.stdscr.attron(curses.color_pair(8))
-                    if i + scroll_offset == selected:
-                        self.stdscr.attron(curses.color_pair(2))
+                        progress_str = "[100%]"
+                    elif episode.progress > 0:
+                        progress_str = f"[{int(episode.progress):3d}%]"
+                    else:
+                        progress_str = "[  0%]"
                     
-                    self.stdscr.addstr(row, 2, line[:width-4])
+                    # Build line with fixed-width columns
+                    # Format: STATUS TITLE - PODCAST [DURATION] [PROGRESS]
+                    line = f"{status_icon}{title:<{available_title_width}} - {podcast_name:<{podcast_min_width}} {duration_str} {progress_str}"
                     
-                    if i + scroll_offset == selected:
-                        self.stdscr.attroff(curses.color_pair(2))
-                    if episode.server_completed:
-                        self.stdscr.attroff(curses.color_pair(8))
+                    # Ensure we don't exceed screen width
+                    max_len = width - 4
+                    if len(line) > max_len:
+                        line = line[:max_len]
+                    
+                    try:
+                        # Apply colors
+                        if episode.server_completed:
+                            self.stdscr.attron(curses.color_pair(8))  # Gray for completed
+                        if i + scroll_offset == selected:
+                            self.stdscr.attron(curses.A_REVERSE)
+                        
+                        self.stdscr.addstr(row, 2, line)
+                        
+                        if i + scroll_offset == selected:
+                            self.stdscr.attroff(curses.A_REVERSE)
+                        if episode.server_completed:
+                            self.stdscr.attroff(curses.color_pair(8))
+                    except Exception as e:
+                        log(f"Error drawing line at row {row}: {str(e)}")
 
             self.stdscr.refresh()
             key = self.stdscr.getch()
@@ -1453,13 +1669,39 @@ class Litepop:
         self.status_timeout = time.time() + timeout
 
     def play_selected(self, index: int) -> bool:
-        """Plays selected episode"""
-        if 0 <= index < len(self.queue):
-            if self.player.play(self.queue[index]):
-                self.current_index = index
-                self.set_status_message(f"Playing: {self.queue[index].title}")
-                return True
-        return False
+        """Plays selected episode, downloading if necessary"""
+        if not (0 <= index < len(self.queue)):
+            return False
+        
+        episode = self.queue[index]
+        
+        # Verificar si el archivo existe
+        if not self.download_manager.is_downloaded(episode):
+            # Verificar si está descargando
+            if self.download_manager.is_downloading(episode):
+                self.set_status_message(f"Downloading: {episode.title}... Please wait.")
+                return False
+            
+            # Verificar si hubo un error previo
+            error = self.download_manager.get_download_error(episode)
+            if error:
+                self.set_status_message(f"Retrying download: {episode.title}")
+                log(f"Previous download error: {error}")
+            else:
+                self.set_status_message(f"Starting download: {episode.title}")
+            
+            # Iniciar descarga
+            self.download_manager.download_episode(episode, callback=lambda ep: self._on_download_complete(ep))
+            return False
+        
+        # El archivo existe, reproducir
+        if self.player.play(episode):
+            self.current_index = index
+            self.set_status_message(f"Playing: {episode.title}")
+            return True
+        else:
+            self.set_status_message(f"Error playing: {episode.title}")
+            return False
 
     def play_next(self) -> bool:
         """Plays next episode in queue"""
@@ -1476,6 +1718,17 @@ class Litepop:
         self.player.stop()
         self.set_status_message("Beginning of queue.")
         return False
+    
+    def _on_download_complete(self, episode: Episode) -> None:
+        """Callback when download completes"""
+        log(f"Download complete callback: {episode.title}")
+        
+        # Si es el episodio actualmente seleccionado, intentar reproducir automáticamente
+        if (0 <= self.current_index < len(self.queue) and 
+            self.queue[self.current_index] == episode and 
+            not self.player.playing):
+            
+            threading.Timer(0.5, lambda: self.play_selected(self.current_index)).start()
 
     def delete_episode(self, index: int) -> bool:
         """Deletes episode from queue"""
@@ -1595,8 +1848,31 @@ class Litepop:
                         episode.completed = False
                         episode.server_completed = False
                         episode.progress = 0.0
-                        self.set_status_message(f"Progress reset for: {episode.title}")
-                        self._sync_episode_position(episode)
+        
+                        # Subir reset inmediatamente al servidor
+                        action = {
+                            "podcast": episode.podcast_url or episode.podcast_title,
+                            "episode": episode.url,
+                            "action": "play",
+                            "timestamp": datetime.now().isoformat(),
+                            "position": 0,
+                            "started": 0,
+                            "total": int(episode.duration) if episode.duration else -1,
+                            "guid": episode.guid
+                        }
+                        result = self.gpodder.upload_episode_actions([action])
+        
+                        # Actualizar el cache local también
+                        if episode.url in self.episode_actions_cache:
+                            self.episode_actions_cache[episode.url] = {
+                                "progress": 0.0,
+                                "position": 0,
+                                "total": int(episode.duration) if episode.duration else -1,
+                                "server_completed": False,
+                                "last_action": "play",
+                                "last_timestamp": action["timestamp"]
+                            }
+                        self.set_status_message(f"Progress reset and synced: {episode.title}")
                 elif key == ord('c'):  # Clear completed
                     self.clear_completed_episodes()
                 elif key == ord('r'):  # Manual sync
