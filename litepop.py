@@ -36,6 +36,12 @@ def log(msg: str, log_file: Optional[str] = None) -> None:
     
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Filter out non-meaningful messages for UI display
+    msg_lower = msg.lower().strip()
+    if msg_lower in ['{}', '}', '{', '[]', 'none', '']:
+        return  # Don't log empty/meaningless messages
+    
     with open(log_file, "a") as f:
         f.write(f"{datetime.now()}: {msg}\n")
 
@@ -216,7 +222,8 @@ class GPodderSync:
             
             # AÑADIR: Log del contenido de la respuesta (primeros 200 caracteres)
             content_preview = resp.text[:200] + "..." if len(resp.text) > 200 else resp.text
-            log(f"Episode actions raw response preview: {content_preview}")
+            if content_preview.strip() not in ['{}', '[]', '']:
+                log(f"Response preview: {content_preview}")
             
             try:
                 data = resp.json()
@@ -409,7 +416,10 @@ class GPodderSync:
             if resp.content:
                 try:
                     response_text = resp.text[:500] + "..." if len(resp.text) > 500 else resp.text
-                    log(f"Episode actions upload response: {response_text}")
+                    if response_text.strip() not in ['{}', '[]', '']:
+                        log(f"Upload response: {response_text}")
+                    else:
+                        log(f"Successfully uploaded {len(formatted_actions)} actions")
                 except:
                     log(f"Episode actions upload response (bytes): {resp.content[:200]}...")
         
@@ -1353,7 +1363,10 @@ class Litepop:
                     title = episode.title[:max(25, width - 50)]
                     if len(episode.title) > max(25, width - 50):
                         title += "..."
-                    status = f"Playing: {title} (x{self.player.speed}) ({pos_str}/{dur_str})"
+                    local_progress = 0
+                    if self.player.get_duration() > 0:
+                        local_progress = (self.player.get_position() / self.player.get_duration()) * 100
+                    status = f"Playing at x{self.player.speed}: ({pos_str}/{dur_str}) [{int(local_progress)}%] {title}"
 
                 self.stdscr.addstr(2, 2, f"Status: {status}"[:width-4])
                 
@@ -1442,16 +1455,13 @@ class Litepop:
                         server_progress = server_status.get("progress", 0.0)
                         server_completed = server_status.get("server_completed", False)
 
-                        # Always show playback progress, never download progress
+                        # Only show progress that has been synced to/from server
                         if server_completed or episode.server_completed or episode.completed:
                             progress_str = " [100%]"
                         elif server_progress > 0:
                             progress_str = f" [{int(server_progress):3d}%]"
-                        elif episode.position > 0 and episode.duration and episode.duration > 0:
-                            progress_pct = (episode.position / episode.duration) * 100
-                            progress_str = f" [{int(progress_pct):3d}%]"
                         else:
-                            progress_str = " [  0%]"
+                            progress_str = " [  0%]"  # Show 0% if nothing synced yet
                         
                         # Build the line with proper spacing
                         line = f"[{status_icon}] {title:<{available_title_width}}{duration_str}{progress_str}"
@@ -1480,7 +1490,7 @@ class Litepop:
                 # Help text
                 help_row = height - 4
                 help_lines = [
-                    f"SPACE:Play/Pause | ENTER:Next | </>:Seek | d:Del | D:Del+Done | a:Add | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
+                    f"SPACE:Play/Pause | ENTER:Next | <-/->:Seek | d:Del | D:Del+Done | a:Add | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
                     "Status: [>>>]=Playing [II]=Paused [DWN]=Downloading [PND]=Pending [DON]=Done [ERR]=Error"
                 ]
                 for i, line in enumerate(help_lines):
