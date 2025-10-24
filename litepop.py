@@ -117,24 +117,78 @@ class GPodderSync:
         """If device_id is 'default', get device list from server and use the first one"""
         try:
             if self.device_id != "default":
+                log(f"Using configured device_id: {self.device_id}")
                 return
             
             if self.backend == "opodsync":
+                # Para opodsync, obtener lista de devices
                 url = urljoin(self.server_url, f"api/2/devices/{self.username}.json")
-            else:
-                # For nextcloud, we don't need to resolve device_id
-                return
+                log(f"Resolving device_id from: {url}")
                 
-            resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=15)
-            if resp.ok and resp.content:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    first = data[0]
-                    if isinstance(first, dict) and "id" in first:
-                        self.device_id = first["id"]
-                        log(f"Resolved device_id 'default' -> '{self.device_id}'")
+                resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+                resp.raise_for_status()
+                
+                if resp.ok and resp.content:
+                    data = resp.json()
+                    log(f"Devices response: {data}")
+                    
+                    if isinstance(data, list) and data:
+                        # Buscar un device que no sea de Android (para evitar conflictos)
+                        # o crear uno nuevo para litepop
+                        litepop_device = None
+                        for dev in data:
+                            if isinstance(dev, dict) and "id" in dev:
+                                dev_id = dev["id"]
+                                dev_type = dev.get("type", "")
+                                # Preferir un device existente de litepop
+                                if "litepop" in dev_id.lower():
+                                    litepop_device = dev_id
+                                    break
+                        
+                        if litepop_device:
+                            self.device_id = litepop_device
+                            log(f"Using existing litepop device: {self.device_id}")
+                        else:
+                            # Usar el primer device disponible
+                            first = data[0]
+                            if isinstance(first, dict) and "id" in first:
+                                self.device_id = first["id"]
+                                log(f"Resolved device_id 'default' -> '{self.device_id}'")
+                    else:
+                        log("No devices found in response")
+                        # Crear un device_id único para litepop
+                        import socket
+                        hostname = socket.gethostname()
+                        self.device_id = f"litepop-{hostname}"
+                        log(f"Creating new device_id: {self.device_id}")
+                        # Registrar el device
+                        self._register_device()
+            else:
+                # Para nextcloud, no necesitamos device_id específico
+                self.device_id = "litepop"
+                log(f"Using default device_id for nextcloud: {self.device_id}")
+                
         except Exception as e:
             log(f"Could not resolve device id: {str(e)}")
+            import socket
+            hostname = socket.gethostname()
+            self.device_id = f"litepop-{hostname}"
+            log(f"Fallback device_id: {self.device_id}")
+            
+    def _register_device(self) -> None:
+        """Register a new device with opodsync"""
+        try:
+            if self.backend == "opodsync":
+                url = urljoin(self.server_url, f"api/2/devices/{self.username}/{self.device_id}.json")
+                data = {
+                    "caption": "litepop Terminal Player",
+                    "type": "desktop"
+                }
+                resp = self.session.post(url, json=data, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+                resp.raise_for_status()
+                log(f"Device registered successfully: {self.device_id}")
+        except Exception as e:
+            log(f"Could not register device: {str(e)}")
 
     def get_subscriptions(self) -> List[str]:
         """Get subscriptions from server"""
@@ -311,7 +365,13 @@ class GPodderSync:
         try:
             if not actions:
                 return {}
-
+            
+            # Añadir al log más info de sync Gpodder
+            log(f"=== UPLOADING {len(actions)} ACTIONS ===")
+            log(f"Backend: {self.backend}")
+            log(f"Device ID: {self.device_id}")
+            log(f"Server URL: {self.server_url}")
+            
             # Format actions according to backend requirements
             formatted_actions = []
             for action in actions:
@@ -360,7 +420,7 @@ class GPodderSync:
             
                 # Add device field for opodsync (required)
                 if self.backend == "opodsync":
-                    formatted_action["device"] = self.device_id
+                    formatted_action["device"] = str(self.device_id)
             
                 # Add optional fields if present and valid
                 for field in ["position", "started", "total"]:
@@ -394,6 +454,9 @@ class GPodderSync:
 
             log(f"Uploading {len(formatted_actions)} episode actions to: {url}")
             log(f"Sample action: {json.dumps(formatted_actions[0] if formatted_actions else {}, indent=2)}")
+            # Log all actions being uploaded for debugging
+            for idx, action in enumerate(formatted_actions):
+                log(f"Action {idx+1}/{len(formatted_actions)}: {action['action']} - {action.get('position', 'N/A')}s / {action.get('total', 'N/A')}s - device: {action.get('device', 'N/A')}")
         
             # Prepare headers
             headers = {
@@ -619,6 +682,9 @@ class DownloadManager:
             self.downloads[episode.url].daemon = True
             self.downloads[episode.url].start()
             log(f"Started download: {episode.title}")
+            if callback:
+                # Notificar inicio de descarga también
+                threading.Timer(0.1, lambda: callback(episode)).start()
             return True
 
     def _download_worker(self, episode: Episode, filename: str, callback: Optional[callable]) -> None:
@@ -891,6 +957,7 @@ class Litepop:
         self.last_log_line = ""
         self.episode_actions_cache = {}
         self.ui_refresh_lock = threading.Lock()
+        self.needs_refresh = threading.Event()
         self.initial_sync_done = False
         self.threads = [
             threading.Thread(target=self._sync_worker, daemon=True),
@@ -938,6 +1005,8 @@ class Litepop:
 
     def _position_sync_worker(self) -> None:
         """Syncs playback position to gPodder every 30 seconds"""
+        last_synced_position = {}  # Track last synced position per episode
+        
         while self.running:
             try:
                 if self.player.playing and 0 <= self.current_index < len(self.queue):
@@ -945,22 +1014,48 @@ class Litepop:
                     position = int(self.player.get_position())
                     duration = self.player.get_duration()
                     
-                    if position > 0:  # Only sync if we have a meaningful position
+                    # Only sync if:
+                    # 1. Position is meaningful (>5 seconds)
+                    # 2. Position has changed significantly (>10 seconds from last sync)
+                    # 3. We have a valid duration
+                    last_pos = last_synced_position.get(episode.url, 0)
+                    
+                    if position > 5 and abs(position - last_pos) > 10 and duration > 0:
+                        # IMPORTANTE: Validar que tenemos device_id válido
+                        if not self.gpodder.device_id or self.gpodder.device_id == "default":
+                            log("ERROR: device_id not resolved yet, skipping position sync")
+                            time.sleep(30)
+                            continue
+                        
                         action = {
                             "podcast": episode.podcast_url or episode.podcast_title,
                             "episode": episode.url,
                             "action": "play",
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "device": self.gpodder.device_id,  # CRÍTICO: incluir device
                             "position": position,
                             "started": 0,
-                            "total": int(duration) if duration and duration > 0 else 0,
-                            "guid": episode.guid
+                            "total": int(duration) if duration > 0 else 0,
                         }
-                        log(f"Syncing position: {episode.title} at {position}s")
-                        self.gpodder.upload_episode_actions([action])
+                        
+                        # Solo agregar guid si existe y no está vacío
+                        if episode.guid and str(episode.guid).strip():
+                            action["guid"] = str(episode.guid).strip()
+                        
+                        log(f"Syncing position: {episode.title} at {position}s/{int(duration)}s ({(position/duration*100):.1f}%) to device {self.gpodder.device_id}")
+                        result = self.gpodder.upload_episode_actions([action])
+                        
+                        if result and "error" not in result:
+                            last_synced_position[episode.url] = position
+                            log(f"Position sync successful for {episode.title}")
+                        else:
+                            log(f"Position sync failed: {result}")
+                            
                 time.sleep(30)
             except Exception as e:
                 log(f"Error in position sync: {str(e)}")
+                import traceback
+                log(f"Traceback: {traceback.format_exc()}")
                 time.sleep(60)
 
     def _sync_worker(self) -> None:
@@ -1042,6 +1137,7 @@ class Litepop:
                             self.player.stop()  # Force stop mpv to release resources
                             self.mark_episode_completed(episode)
                             self.set_status_message(f"Completed: {episode.title}")
+                            self.needs_refresh.set()
 
                             # Reset counters
                             consecutive_end_checks = 0
@@ -1128,6 +1224,7 @@ class Litepop:
             self.last_sync = datetime.now()
             self._load_auto_queue()
             log(f"Sync completed: {len(new_feeds)} feeds loaded")
+            self.needs_refresh.set()
             return True
             
         except Exception as e:
@@ -1142,8 +1239,8 @@ class Litepop:
                 continue
                 
             # Initialize cache entry if doesn't exist
-            if episode_url not in self.episode_actions_cache:  # CAMBIAR: litepop_instance. -> self.
-                self.episode_actions_cache[episode_url] = {  # CAMBIAR: litepop_instance. -> self.
+            if episode_url not in self.episode_actions_cache:
+                self.episode_actions_cache[episode_url] = {
                     "progress": 0.0,
                     "position": 0,
                     "total": -1,
@@ -1152,7 +1249,7 @@ class Litepop:
                     "last_timestamp": ""
                 }
                 
-            cache_entry = self.episode_actions_cache[episode_url]  # CAMBIAR: litepop_instance. -> self.
+            cache_entry = self.episode_actions_cache[episode_url]
             action_type = action.get("action", "").lower()
             timestamp = action.get("timestamp", "")
             
@@ -1174,15 +1271,15 @@ class Litepop:
                     progress = (cache_entry["position"] / total) * 100
                     cache_entry["progress"] = min(progress, 100.0)
                     
-                    # Mark as completed if >95%
-                    if progress > 95.0:
+                    if progress >= 98.0:
                         cache_entry["server_completed"] = True
-                        cache_entry["progress"] = 100.0
+                        log(f"Episode marked as completed via progress: {episode_url} ({progress:.1f}%)")
                         
             elif action_type == "download":
-                # Download action means episode was completed
-                cache_entry["server_completed"] = True
-                cache_entry["progress"] = 100.0
+                # Download action means episode was explicitly downloaded
+                #cache_entry["server_completed"] = True
+                #cache_entry["progress"] = 100.0
+                log(f"Episode downloaded (not necessarily completed): {episode_url}")
                 
             log(f"Updated cache for {episode_url}: pos={cache_entry['position']}, progress={cache_entry['progress']:.1f}%, completed={cache_entry['server_completed']}")
 
@@ -1200,31 +1297,36 @@ class Litepop:
         log("Loading auto queue from episode actions")
         
         # Update existing queue items with server status
-        for episode in self.queue:  # CAMBIAR: litepop_instance.queue -> self.queue
-            server_status = self._get_episode_server_status(episode.url)  # CAMBIAR: litepop_instance._get... -> self._get...
-            episode.server_completed = server_status["server_completed"]
+        for episode in self.queue:
+            server_status = self._get_episode_server_status(episode.url)
+            # CORRECCIÓN: Solo marcar como completado si el progreso >= 98%
+            if server_status["progress"] >= 98.0:
+                episode.server_completed = True
+            else:
+                episode.server_completed = False
             episode.position = max(episode.position, server_status["position"])
-            episode.progress = max(episode.progress, server_status["progress"])
 
         # Find episodes to add to queue with more flexible criteria
         episodes_added = 0
-        for episode_url, cache_data in self.episode_actions_cache.items():  # CAMBIAR: litepop_instance.episode... -> self.episode...
+        for episode_url, cache_data in self.episode_actions_cache.items():
             progress = cache_data.get("progress", 0.0)
             position = cache_data.get("position", 0)
-            is_completed = cache_data.get("server_completed", False)
+            is_completed = progress >= 98.0
             
             # Add episodes that:
-            # 1. Have some progress (position > 30s) but aren't completed
-            # 2. OR have 1-98% progress
+            # 1. Have some progress (position > 30s) but aren't explicitly completed
+            # 2. AND are below 95% (to avoid adding nearly-finished episodes)
             should_add = (
-                (position > 30 and not is_completed) or 
-                (1 <= progress < 98)
-            ) and not any(ep.url == episode_url for ep in self.queue)  # CAMBIAR: litepop_instance.queue -> self.queue
+                position > 30 and 
+                not is_completed and 
+                progress < 95.0 and
+                not any(ep.url == episode_url for ep in self.queue)
+            )
             
             if should_add:
                 # Find the episode in our feeds
                 found_episode = None
-                for feed in self.subscriptions:  # CAMBIAR: litepop_instance.subscriptions -> self.subscriptions
+                for feed in self.subscriptions:
                     for episode_data in feed.episodes:
                         if episode_data["url"] == episode_url:
                             found_episode = episode_data
@@ -1233,12 +1335,12 @@ class Litepop:
                         break
                 
                 if found_episode:
-                    episode = Episode(found_episode)  # REMOVER: "from litepop import Episode" - ya está definido arriba
+                    episode = Episode(found_episode)
                     episode.progress = progress
                     episode.position = position
                     episode.server_completed = is_completed
-                    self.queue.append(episode)  # CAMBIAR: litepop_instance.queue -> self.queue
-                    self.download_manager.download_episode(episode)  # CAMBIAR: litepop_instance.download_manager -> self.download_manager
+                    self.queue.append(episode)
+                    self.download_manager.download_episode(episode)
                     episodes_added += 1
                     log(f"Added episode to queue: {episode.title} (progress: {progress:.1f}%, position: {position}s)")
                 else:
@@ -1300,30 +1402,28 @@ class Litepop:
         episode.completed = True
         episode.progress = 100.0
         episode.server_completed = True
-    
+
+        # Set position to duration for completion
         if episode.duration:
             episode.position = episode.duration
-    
+        
+        final_position = int(episode.duration or 0)
+        
         # Upload both download and final play action
         actions = [
             {
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
-                "action": "download",
-                "timestamp": datetime.now().isoformat(),
-                "guid": episode.guid
-            },
-            {
-                "podcast": episode.podcast_url or episode.podcast_title,
-                "episode": episode.url,
                 "action": "play",
                 "timestamp": datetime.now().isoformat(),
-                "position": int(episode.position) if episode.position else int(episode.duration or 0),
+                "position": final_position,
                 "started": 0,
-                "total": int(episode.duration or -1),
-                "guid": episode.guid
+                "total": final_position if final_position > 0 else -1,
+                "guid": episode.guid if episode.guid else ""
             }
         ]
+        
+        log(f"Uploading completion actions: position={final_position}, total={final_position}")
     
         if self.gpodder.upload_episode_actions(actions):
             self.episode_actions_cache[episode.url] = {
@@ -1336,6 +1436,7 @@ class Litepop:
         # Clean up the file after a short delay
         if episode.local_file:
             threading.Timer(1.0, lambda: self.download_manager.cleanup_file(episode.local_file)).start()
+            self.needs_refresh.set()
 
     def draw_header(self) -> None:
         """Draws header for UI"""
@@ -1381,7 +1482,11 @@ class Litepop:
                 if not self.queue:
                     self.stdscr.addstr(start_row, 2, "Queue empty. Press 'a' to add episodes.")
                     if not self.subscriptions:
-                        self.stdscr.addstr(start_row + 1, 2, "No subscriptions. Check gPodder config.")
+                        # CORRECCIÓN: Distinguir entre "cargando" y "sin suscripciones"
+                        if not self.initial_sync_done:
+                            self.stdscr.addstr(start_row + 1, 2, "Loading subscriptions from server...")
+                        else:
+                            self.stdscr.addstr(start_row + 1, 2, "No subscriptions found. Check gPodder config.")
                 else:
                     # Calculate scroll offset to keep selected item visible
                     scroll_offset = max(0, min(selected_index - visible_items // 2, len(self.queue) - visible_items))
@@ -1416,14 +1521,17 @@ class Litepop:
                         color_pair = 0
                         
                         # Determine status
+                        server_status = self._get_episode_server_status(episode.url)
+                        server_progress = server_status.get("progress", 0.0)
+                        
                         if episode.downloading:
                             if hasattr(episode, 'progress') and episode.progress > 0:
                                 status_icon = f"D{int(episode.progress):2d}"
                             else:
                                 status_icon = "DWN"
                             color_pair = 4  # Yellow
-                        elif episode.completed or episode.server_completed:
-                            # Mostrar como completado aunque el archivo ya se haya limpiado
+                        elif server_progress >= 98.0 or episode.completed:
+                            # COMPLETADO: >= 98% de reproducción
                             status_icon = "DON"
                             color_pair = 8  # Gray/dimmed
                         elif not self.download_manager.is_downloaded(episode):
@@ -1451,17 +1559,19 @@ class Litepop:
                         # Progress percentage
                         # Progress percentage (playback progress from server, NOT download progress)
                         progress_str = ""
-                        server_status = self._get_episode_server_status(episode.url)
+                        # Ya obtuvimos server_status arriba, reutilizarlo si es posible
+                        # o volver a obtenerlo si no está en scope
+                        if 'server_status' not in locals():
+                            server_status = self._get_episode_server_status(episode.url)
                         server_progress = server_status.get("progress", 0.0)
-                        server_completed = server_status.get("server_completed", False)
-
-                        # Only show progress that has been synced to/from server
-                        if server_completed or episode.server_completed or episode.completed:
+                
+                        # CORRECCIÓN: Mostrar 100% solo si progreso >= 98%
+                        if server_progress >= 98.0:
                             progress_str = " [100%]"
                         elif server_progress > 0:
                             progress_str = f" [{int(server_progress):3d}%]"
                         else:
-                            progress_str = " [  0%]"  # Show 0% if nothing synced yet
+                            progress_str = " [  0%]"
                         
                         # Build the line with proper spacing
                         line = f"[{status_icon}] {title:<{available_title_width}}{duration_str}{progress_str}"
@@ -1538,7 +1648,8 @@ class Litepop:
                 if not any(ep.url == episode["url"] for ep in self.queue):
                     episode_obj = Episode(episode)
                     server_status = self._get_episode_server_status(episode_obj.url)
-                    episode_obj.server_completed = server_status.get("server_completed", False)
+                    # CORRECCIÓN: Determinar completado basado en progreso
+                    episode_obj.server_completed = server_status.get("progress", 0.0) >= 98.0
                     episode_obj.progress = server_status.get("progress", 0.0)
                     episode_obj.position = server_status.get("position", 0)
                     all_episodes.append(episode_obj)
@@ -1677,6 +1788,7 @@ class Litepop:
         """Sets temporary status message"""
         self.status_message = message
         self.status_timeout = time.time() + timeout
+        self.needs_refresh.set() 
 
     def play_selected(self, index: int) -> bool:
         """Plays selected episode, downloading if necessary"""
@@ -1708,6 +1820,7 @@ class Litepop:
         if self.player.play(episode):
             self.current_index = index
             self.set_status_message(f"Playing: {episode.title}")
+            self.needs_refresh.set()
             return True
         else:
             self.set_status_message(f"Error playing: {episode.title}")
@@ -1732,6 +1845,7 @@ class Litepop:
     def _on_download_complete(self, episode: Episode) -> None:
         """Callback when download completes"""
         log(f"Download complete callback: {episode.title}")
+        self.needs_refresh.set()
         
         # Si es el episodio actualmente seleccionado, intentar reproducir automáticamente
         if (0 <= self.current_index < len(self.queue) and 
@@ -1803,9 +1917,19 @@ class Litepop:
         
         selected_index = 0
         try:
+            self.stdscr.timeout(100)
             while self.running:
                 self.draw_queue(selected_index)
+                
+                # Esperar evento de refresco o tecla
+                if self.needs_refresh.wait(timeout=0.1):
+                    self.needs_refresh.clear()
+                    continue  # Refrescar inmediatamente
+                
                 key = self.stdscr.getch()
+                
+                if key == -1:
+                    continue
                 
                 if key == curses.KEY_UP:
                     selected_index = max(0, selected_index - 1)
