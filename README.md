@@ -49,6 +49,7 @@ Make sure the config file is generated at `~/.config/litepop.conf` upon first ru
 | `s`         | Change playback speed (cyclic)  |
 | `R`         | Reset progress of selected item |
 | `c`         | Clear completed items           |
+| `v`         | Retry download                  |
 | `r`         | Force sync with gPodder         |
 | `ESC` / `q` | Exit                            |
 
