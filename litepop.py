@@ -110,8 +110,57 @@ class GPodderSync:
         # Resolve device_id "default" for opodsync
         try:
             self._resolve_device_id()
+            self._verify_device_registration()
         except Exception as e:
             log(f"Could not resolve device_id: {str(e)}")
+
+    def _cleanup_duplicate_devices(self) -> None:
+        """Merge duplicate devices by updating them all with the same data"""
+        try:
+            url = urljoin(self.server_url, f"api/2/devices/{self.username}.json")
+            resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+            resp.raise_for_status()
+            devices = resp.json()
+            
+            # Contar cuántos dispositivos tienen este device_id
+            duplicates = [dev for dev in devices if isinstance(dev, dict) and dev.get("id") == self.device_id]
+            
+            if len(duplicates) > 1:
+                log(f"Found {len(duplicates)} duplicate devices with id {self.device_id}, merging...")
+                
+                # Actualizar todos los duplicados con los mismos datos
+                # Esto los "fusiona" efectivamente
+                data = {
+                    "caption": "litepop Terminal Player",
+                    "type": "desktop"
+                }
+                update_url = urljoin(self.server_url, f"api/2/devices/{self.username}/{self.device_id}.json")
+                resp = self.session.post(update_url, json=data, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+                resp.raise_for_status()
+                log(f"Merged {len(duplicates)} duplicate devices into one")
+                    
+        except Exception as e:
+            log(f"Error cleaning up duplicates: {str(e)}")
+
+    def _verify_device_registration(self) -> None:
+        """Verify if device_id is registered, register if not"""
+        # Primero fusionar duplicados si existen
+        self._cleanup_duplicate_devices()
+        
+        try:
+            url = urljoin(self.server_url, f"api/2/devices/{self.username}.json")
+            resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+            resp.raise_for_status()
+            devices = resp.json()
+            device_ids = [dev["id"] for dev in devices if isinstance(dev, dict) and "id" in dev]
+            if self.device_id not in device_ids:
+                log(f"Device {self.device_id} not found, registering...")
+                self._register_device()
+            else:
+                log(f"Device {self.device_id} already registered")
+        except Exception as e:
+            log(f"Error verifying device registration: {str(e)}")
+            # NO registrar automáticamente en caso de error
 
     def _resolve_device_id(self) -> None:
         """If device_id is 'default', get device list from server and use the first one"""
@@ -185,6 +234,12 @@ class GPodderSync:
                     "type": "desktop"
                 }
                 resp = self.session.post(url, json=data, headers={"User-Agent": "litepop/1.0"}, timeout=15)
+                
+                # Manejar caso de dispositivo duplicado (si el servidor lo soporta)
+                if resp.status_code == 409:
+                    log(f"Device {self.device_id} already exists")
+                    return
+                
                 resp.raise_for_status()
                 log(f"Device registered successfully: {self.device_id}")
         except Exception as e:
@@ -366,7 +421,6 @@ class GPodderSync:
             if not actions:
                 return {}
             
-            # Añadir al log más info de sync Gpodder
             log(f"=== UPLOADING {len(actions)} ACTIONS ===")
             log(f"Backend: {self.backend}")
             log(f"Device ID: {self.device_id}")
@@ -375,74 +429,103 @@ class GPodderSync:
             # Format actions according to backend requirements
             formatted_actions = []
             for action in actions:
+                # CRÍTICO: Validar que tenemos los campos mínimos requeridos
+                if not action.get("podcast") or not action.get("episode"):
+                    log(f"Skipping action without podcast/episode URL: {action}")
+                    continue
+                
                 # Create base action with required fields
                 formatted_action = {
-                    "podcast": str(action.get("podcast", "")),
-                    "episode": str(action.get("episode", "")),
-                    "action": str(action.get("action", "")).lower(),
+                    "podcast": str(action.get("podcast", "")).strip(),
+                    "episode": str(action.get("episode", "")).strip(),
+                    "action": str(action.get("action", "play")).lower(),
                 }
             
-                # Handle timestamp with multiple format attempts
+                # Handle timestamp
                 timestamp = action.get("timestamp")
                 if timestamp:
                     try:
-                        # Parse various timestamp formats
                         if isinstance(timestamp, str):
-                            # Try ISO format first
                             if 'T' in timestamp:
-                                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            # Try Unix timestamp string
+                                # Remover microsegundos si existen
+                                timestamp = timestamp.split('.')[0]
+                                if timestamp.endswith('Z'):
+                                    timestamp = timestamp[:-1]
+                                dt = datetime.fromisoformat(timestamp)
                             elif timestamp.isdigit():
                                 dt = datetime.fromtimestamp(int(timestamp))
                             else:
-                                # Fallback to current time
                                 dt = datetime.now()
                         elif isinstance(timestamp, (int, float)):
                             dt = datetime.fromtimestamp(timestamp)
                         else:
                             dt = datetime.now()
                     
-                        # Format timestamp based on backend
+                        # Formato ISO: opodsync prefiere con Z, Nextcloud acepta ambos
                         if self.backend == "opodsync":
-                            # opodsync prefers ISO format without microseconds and with Z suffix
                             formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                         else:
-                            # Nextcloud format
+                            # Nextcloud acepta sin Z también
                             formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S")
                             
                     except Exception as e:
                         log(f"Error formatting timestamp {timestamp}: {str(e)}")
                         dt = datetime.now()
-                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ" if self.backend == "opodsync" else "%Y-%m-%dT%H:%M:%S")
+                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 else:
                     dt = datetime.now()
-                    formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ" if self.backend == "opodsync" else "%Y-%m-%dT%H:%M:%S")
+                    formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             
-                # Add device field for opodsync (required)
+                # CRÍTICO: device es obligatorio para opodsync, opcional para Nextcloud
                 if self.backend == "opodsync":
                     formatted_action["device"] = str(self.device_id)
+                # Nextcloud también acepta device pero no es estrictamente necesario
             
                 # Add optional fields if present and valid
-                for field in ["position", "started", "total"]:
-                    if field in action and action[field] is not None:
-                        try:
-                            value = int(float(action[field]))
-                            if field == "total":
-                                if value > 0:
-                                    formatted_action[field] = value
-                                else:
-                                    if value >= 0:
-                                        formatted_action[field] = value
-                            elif value >= 0:
-                                formatted_action[field] = value
-                        except (ValueError, TypeError):
-                            pass
+                action_type = formatted_action["action"]
+                
+                # Para "play" actions, incluir position/started/total
+                if action_type == "play":
+                    position = action.get("position", 0)
+                    started = action.get("started", 0)
+                    total = action.get("total", 0)
+                    
+                    # Validar y añadir position
+                    try:
+                        pos_int = int(float(position)) if position is not None else 0
+                        if pos_int >= 0:
+                            formatted_action["position"] = pos_int
+                    except (ValueError, TypeError):
+                        formatted_action["position"] = 0
+                    
+                    # Validar y añadir started
+                    try:
+                        start_int = int(float(started)) if started is not None else 0
+                        if start_int >= 0:
+                            formatted_action["started"] = start_int
+                    except (ValueError, TypeError):
+                        formatted_action["started"] = 0
+                    
+                    # Validar y añadir total
+                    try:
+                        total_int = int(float(total)) if total is not None else 0
+                        if total_int > 0:  # Solo si es positivo
+                            formatted_action["total"] = total_int
+                    except (ValueError, TypeError):
+                        pass  # No añadir total si es inválido
             
-                # Only add guid if it's not empty
-                if "guid" in action and action["guid"] and str(action["guid"]).strip():
-                    formatted_action["guid"] = str(action["guid"]).strip()
-            
+                # CRÍTICO: guid es muy importante para AntennaPod
+                # AntennaPod usa el guid para identificar episodios
+                if "guid" in action and action["guid"]:
+                    guid_str = str(action["guid"]).strip()
+                    if guid_str and guid_str.lower() != "none":
+                        formatted_action["guid"] = guid_str
+                
                 formatted_actions.append(formatted_action)
+
+            if not formatted_actions:
+                log("No valid actions to upload after formatting")
+                return {"status": "no_actions"}
 
             # Choose the correct endpoint
             if self.backend == "nextcloud":
@@ -452,11 +535,17 @@ class GPodderSync:
             else:
                 raise ValueError(f"Unknown backend: {self.backend}")
 
-            log(f"Uploading {len(formatted_actions)} episode actions to: {url}")
-            log(f"Sample action: {json.dumps(formatted_actions[0] if formatted_actions else {}, indent=2)}")
-            # Log all actions being uploaded for debugging
-            for idx, action in enumerate(formatted_actions):
-                log(f"Action {idx+1}/{len(formatted_actions)}: {action['action']} - {action.get('position', 'N/A')}s / {action.get('total', 'N/A')}s - device: {action.get('device', 'N/A')}")
+            log(f"Uploading to: {url}")
+            
+            # Log sample actions for debugging
+            for idx, action in enumerate(formatted_actions[:3]):  # Solo primeras 3
+                log(f"Action {idx+1}: {action['action']} - "
+                    f"podcast={action.get('podcast', 'N/A')[:50]}... - "
+                    f"episode={action.get('episode', 'N/A')[:50]}... - "
+                    f"position={action.get('position', 'N/A')} - "
+                    f"total={action.get('total', 'N/A')} - "
+                    f"device={action.get('device', 'N/A')} - "
+                    f"guid={action.get('guid', 'N/A')[:30]}...")
         
             # Prepare headers
             headers = {
@@ -473,22 +562,20 @@ class GPodderSync:
                 timeout=30,
             )
         
-            log(f"Episode actions upload response status: {resp.status_code}")
+            log(f"Upload response status: {resp.status_code}")
         
-            # Log response content for debugging
+            # Log response
             if resp.content:
                 try:
-                    response_text = resp.text[:500] + "..." if len(resp.text) > 500 else resp.text
+                    response_text = resp.text[:500]
                     if response_text.strip() not in ['{}', '[]', '']:
                         log(f"Upload response: {response_text}")
-                    else:
-                        log(f"Successfully uploaded {len(formatted_actions)} actions")
                 except:
-                    log(f"Episode actions upload response (bytes): {resp.content[:200]}...")
+                    pass
         
             resp.raise_for_status()
         
-            # Parse response if present
+            # Parse response
             if resp.content:
                 try:
                     result = resp.json()
@@ -509,6 +596,8 @@ class GPodderSync:
             return {"error": str(e)}
         except Exception as e:
             log(f"Error uploading episode actions: {str(e)}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
             return {"error": str(e)}
 
 class PodcastFeed:
@@ -558,6 +647,10 @@ class PodcastFeed:
         pub_date = item.find("pubDate")
         description = item.find("description")
         guid_elem = item.find("guid")
+        
+        guid = None
+        if guid_elem is not None and guid_elem.text:
+            guid = guid_elem.text.strip()
         # itunes duration namespace (some feeds use different namespace variants)
         duration = item.find("{http://www.itunes.com/dtds/podcast-1.0.dtd}duration")
         if duration is None:
@@ -574,7 +667,7 @@ class PodcastFeed:
             "description": description.text if description is not None else "",
             "podcast_title": self.title,
             "podcast": self.url,           # <-- important: include feed URL
-            "guid": guid_elem.text if guid_elem is not None else None,
+            "guid": guid,
             "duration": self._parse_duration(duration.text) if duration is not None and duration.text else None
         }
 
@@ -599,7 +692,9 @@ class Episode:
         self.pub_date = data.get("pub_date")
         self.description = data.get("description")
         self.podcast_title = data.get("podcast_title")
-        self.podcast_url = data.get("podcast")  # <-- nuevo campo
+        self.podcast_url = data.get("podcast") or data.get("podcast_url")
+        if not self.podcast_url:
+            log(f"WARNING: Episode {self.title} has no podcast URL!")
         self.guid = data.get("guid")
         self.duration = data.get("duration")
         self.position = 0
@@ -623,7 +718,9 @@ class DownloadManager:
         self.temp_dir = Path(temp_dir)
         self.max_concurrent = max_concurrent
         self.downloads = {}
-        self.failed_downloads = {}  # NUEVO: Trackear descargas fallidas
+        self.failed_downloads = {}  # Trackear descargas fallidas
+        self.max_retries = 3  # Máximo de reintentos automáticos
+        self.retry_delay = 5  # Segundos entre reintentos
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
 
@@ -718,23 +815,41 @@ class DownloadManager:
                 callback(episode)
                 
         except Exception as e:
-            error_msg = str(e)
-            log(f"Error downloading {episode.url}: {error_msg}")
-            
-            # Registrar el fallo
-            with self.lock:
-                self.failed_downloads[episode.url] = {
-                    "error": error_msg,
-                    "timestamp": datetime.now(),
-                    "attempts": self.failed_downloads.get(episode.url, {}).get("attempts", 0) + 1
-                }
-            
-            # Limpiar archivo parcial si existe
-            try:
-                if Path(filename).exists():
-                    Path(filename).unlink()
-            except:
-                pass
+                    error_msg = str(e)
+                    log(f"Error downloading {episode.url}: {error_msg}")
+                    
+                    # Registrar el fallo
+                    with self.lock:
+                        current_attempts = self.failed_downloads.get(episode.url, {}).get("attempts", 0) + 1
+                        self.failed_downloads[episode.url] = {
+                            "error": error_msg,
+                            "timestamp": datetime.now(),
+                            "attempts": current_attempts
+                        }
+                    
+                    # Limpiar archivo parcial si existe
+                    try:
+                        if Path(filename).exists():
+                            Path(filename).unlink()
+                    except:
+                        pass
+                    
+                    # Reintento automático si no se ha excedido el límite
+                    if current_attempts < self.max_retries:
+                        log(f"Scheduling retry {current_attempts + 1}/{self.max_retries} for {episode.title} in {self.retry_delay}s")
+                        
+                        def retry_download():
+                            time.sleep(self.retry_delay)
+                            log(f"Retrying download ({current_attempts + 1}/{self.max_retries}): {episode.title}")
+                            # Llamar a download_episode pero sin force=True para evitar loop infinito
+                            # Solo si aún no está descargado
+                            if not Path(filename).exists():
+                                self.download_episode(episode, callback=callback, force=False)
+                        
+                        retry_thread = threading.Thread(target=retry_download, daemon=True)
+                        retry_thread.start()
+                    else:
+                        log(f"Max retries ({self.max_retries}) reached for {episode.title}")
                 
         finally:
             with self.lock:
@@ -751,6 +866,17 @@ class DownloadManager:
                 error = failure_info.get("error", "Unknown error")
                 return f"Download failed ({attempts} attempts): {error}"
         return None
+        
+    def retry_download(self, episode: Episode, callback: Optional[callable] = None) -> bool:
+        """Manually retry a failed download, resetting attempt counter"""
+        with self.lock:
+            # Resetear contador de intentos para permitir reintentos manuales
+            if episode.url in self.failed_downloads:
+                self.failed_downloads[episode.url]["attempts"] = 0
+                log(f"Manual retry initiated for {episode.title}, reset attempt counter")
+        
+        # Forzar reintento de descarga
+        return self.download_episode(episode, callback=callback, force=True)
 
     def cleanup_file(self, filename: str) -> None:
         """Removes specified file if it exists"""
@@ -769,8 +895,9 @@ class DownloadManager:
 
 class Player:
     """Manages audio playback using mpv"""
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, sync_callback=None):
         self.config = config
+        self._sync_callback = sync_callback
         self.current_episode = None
         self.process = None
         self.speed = float(config.get("player", "default_speed", "1.0"))
@@ -875,6 +1002,13 @@ class Player:
 
     def stop(self) -> None:
         """Stops playback and cleans up"""
+        # AGREGAR ANTES DE TERMINAR EL PROCESO:
+        if self.current_episode and self.position > 0:
+            self.current_episode.position = self.position
+            # Trigger sync
+            if hasattr(self, '_sync_callback') and self._sync_callback:
+                self._sync_callback(self.current_episode)
+            
         if self.process:
             self.process.terminate()
             try:
@@ -955,10 +1089,12 @@ class Litepop:
         self.stdscr = None
         self.current_screen = "main"
         self.last_log_line = ""
+        self.current_start_position = 0
         self.episode_actions_cache = {}
         self.ui_refresh_lock = threading.Lock()
         self.needs_refresh = threading.Event()
         self.initial_sync_done = False
+        self.selected_index = 0
         self.threads = [
             threading.Thread(target=self._sync_worker, daemon=True),
             threading.Thread(target=self._playback_monitor, daemon=True),
@@ -1005,7 +1141,8 @@ class Litepop:
 
     def _position_sync_worker(self) -> None:
         """Syncs playback position to gPodder every 30 seconds"""
-        last_synced_position = {}  # Track last synced position per episode
+        last_synced_position = {}
+        last_sync_time = {}
         
         while self.running:
             try:
@@ -1014,49 +1151,63 @@ class Litepop:
                     position = int(self.player.get_position())
                     duration = self.player.get_duration()
                     
-                    # Only sync if:
-                    # 1. Position is meaningful (>5 seconds)
-                    # 2. Position has changed significantly (>10 seconds from last sync)
-                    # 3. We have a valid duration
                     last_pos = last_synced_position.get(episode.url, 0)
+                    last_time = last_sync_time.get(episode.url, 0)
+                    current_time = time.time()
                     
-                    if position > 5 and abs(position - last_pos) > 10 and duration > 0:
-                        # IMPORTANTE: Validar que tenemos device_id válido
+                    # Sincronizar si:
+                    # 1. Han pasado 30 segundos desde última sync
+                    # 2. O la posición cambió más de 15 segundos
+                    should_sync = (
+                        position > 5 and 
+                        duration > 0 and
+                        (current_time - last_time > 30 or abs(position - last_pos) > 15)
+                    )
+                    
+                    if should_sync:
                         if not self.gpodder.device_id or self.gpodder.device_id == "default":
                             log("ERROR: device_id not resolved yet, skipping position sync")
                             time.sleep(30)
                             continue
                         
+                        # VALIDAR que tenemos podcast_url
+                        podcast_url = episode.podcast_url or episode.podcast_title
+                        if not podcast_url:
+                            log(f"ERROR: No podcast URL for episode {episode.title}, skipping sync")
+                            time.sleep(30)
+                            continue
+                        
                         action = {
-                            "podcast": episode.podcast_url or episode.podcast_title,
+                            "podcast": podcast_url,
                             "episode": episode.url,
                             "action": "play",
                             "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "device": self.gpodder.device_id,  # CRÍTICO: incluir device
+                            "device": self.gpodder.device_id,
                             "position": position,
                             "started": 0,
                             "total": int(duration) if duration > 0 else 0,
                         }
                         
-                        # Solo agregar guid si existe y no está vacío
+                        # IMPORTANTE: Siempre incluir guid si existe
                         if episode.guid and str(episode.guid).strip():
                             action["guid"] = str(episode.guid).strip()
                         
-                        log(f"Syncing position: {episode.title} at {position}s/{int(duration)}s ({(position/duration*100):.1f}%) to device {self.gpodder.device_id}")
+                        log(f"Syncing position: {episode.title} at {position}s/{int(duration)}s (guid: {action.get('guid', 'none')})")
                         result = self.gpodder.upload_episode_actions([action])
                         
                         if result and "error" not in result:
                             last_synced_position[episode.url] = position
-                            log(f"Position sync successful for {episode.title}")
+                            last_sync_time[episode.url] = current_time
+                            log(f"Position sync successful")
                         else:
                             log(f"Position sync failed: {result}")
                             
-                time.sleep(30)
+                time.sleep(10)  # Revisar cada 10s
             except Exception as e:
                 log(f"Error in position sync: {str(e)}")
                 import traceback
                 log(f"Traceback: {traceback.format_exc()}")
-                time.sleep(60)
+                time.sleep(30)
 
     def _sync_worker(self) -> None:
         """Handles periodic sync with gPodder"""
@@ -1073,10 +1224,12 @@ class Litepop:
 
     def _playback_monitor(self) -> None:
         """Monitors playback status and auto-plays next episode"""
-        consecutive_end_checks = 0  # Counter for consecutive end-of-file checks
+        consecutive_end_checks = 0
         last_position = 0
         position_stuck_count = 0
-    
+        stopped_after_9998_count = 0
+        was_above_9998 = False
+
         while self.running:
             try:
                 if self.player.playing and self.current_index >= 0 and self.current_index < len(self.queue):
@@ -1088,80 +1241,100 @@ class Litepop:
                     episode_completed = False
                     completion_reason = ""
 
-                    # Method 1: Position-based completion (99% threshold)
+                    # Method 1: Position-based completion (99.98% threshold)
                     if duration > 0 and position > 0:
                         progress_percentage = (position / duration) * 100
+                        
+                        if progress_percentage >= 99.98:
+                            was_above_9998 = True
+                        
                         if progress_percentage >= 99.98 or duration - position < 1.5:
                             episode_completed = True
                             completion_reason = f"99.98% threshold reached ({progress_percentage:.1f}%)"
 
-                    # Method 2: Position >= duration (original method)
+                    # Method 2: Position >= duration
                     if duration > 0 and position >= duration:
                         episode_completed = True
                         completion_reason = f"Position >= duration ({position:.1f}/{duration:.1f})"
 
-                    # Method 3: Position stuck at end for multiple checks
+                    # Method 3: Position stuck at end
                     if duration > 0 and position > 0:
-                        poll_interval = 0.5  # o el valor que uses en tu loop
+                        poll_interval = 0.5
                         if abs(position - last_position) < (poll_interval * 0.4) and position >= (duration * 0.98):
                             position_stuck_count += 1
-                            if position_stuck_count >= 4:  # 2 seconds of being stuck at ~end
+                            if position_stuck_count >= 4:
                                 episode_completed = True
                                 completion_reason = f"Position stuck at end ({position:.1f}/{duration:.1f})"
                         else:
                             position_stuck_count = 0
                         last_position = position
 
-                    # Method 4: Process terminated and we were near the end
+                    # Method 4: Process terminated near completion
                     if self.player.process and self.player.process.poll() is not None:
                         if duration > 0 and position >= (duration * 0.95):
                             episode_completed = True
                             completion_reason = f"Process ended near completion ({position:.1f}/{duration:.1f})"
                         else:
-                            # Process ended unexpectedly (not at end)
                             log(f"MPV process terminated unexpectedly at {position:.1f}s of {duration:.1f}s")
                             self.player.playing = False
                             consecutive_end_checks = 0
                             position_stuck_count = 0
+                            stopped_after_9998_count = 0
+                            was_above_9998 = False
                             time.sleep(0.5)
                             continue
+
+                    # Method 5: Stopped after reaching 99.98%
+                    if was_above_9998 and duration > 0 and position > 0:
+                        if abs(position - last_position) < 0.1:
+                            stopped_after_9998_count += 1
+                            if stopped_after_9998_count >= 4:
+                                episode_completed = True
+                                completion_reason = f"Stopped for 2s after 99.98% ({position:.1f}/{duration:.1f})"
+                        else:
+                            stopped_after_9998_count = 0
 
                     # If episode completed by any method
                     if episode_completed:
                         consecutive_end_checks += 1
                         log(f"Episode completion detected: {completion_reason} (check #{consecutive_end_checks})")
                     
-                        # Require 2 consecutive checks to avoid false positives
                         if consecutive_end_checks >= 2:
                             log(f"Confirming episode completion: {episode.title}")
-                            self.player.stop()  # Force stop mpv to release resources
+                            self.player.stop()
                             self.mark_episode_completed(episode)
                             self.set_status_message(f"Completed: {episode.title}")
                             self.needs_refresh.set()
 
-                            # Reset counters
                             consecutive_end_checks = 0
                             position_stuck_count = 0
+                            stopped_after_9998_count = 0
+                            was_above_9998 = False
 
-                            # Auto-play next episode after a brief pause
+                            # NUEVO: Actualizar selected_index al siguiente episodio antes de reproducir
                             if self.current_index + 1 < len(self.queue):
-                                threading.Timer(1.5, lambda: self.play_selected(self.current_index + 1)).start()
+                                next_index = self.current_index + 1
+                                self.selected_index = next_index  # Mover cursor automáticamente
+                                threading.Timer(1.5, lambda: self.play_selected(next_index)).start()
                             else:
                                 self.set_status_message("Queue completed!")
                     else:
                         consecutive_end_checks = 0
 
-                # Check if the player process has terminated unexpectedly (when not near end)
                 elif self.player.process and self.player.process.poll() is not None and self.player.playing:
                     log("MPV process terminated unexpectedly (not playing).")
                     self.player.playing = False
                     consecutive_end_checks = 0
                     position_stuck_count = 0
+                    stopped_after_9998_count = 0
+                    was_above_9998 = False
 
             except Exception as e:
                 log(f"Error in playback monitor: {str(e)}")
                 consecutive_end_checks = 0
                 position_stuck_count = 0
+                stopped_after_9998_count = 0
+                was_above_9998 = False
 
             time.sleep(0.5)
 
@@ -1365,7 +1538,7 @@ class Litepop:
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
                 "action": "play",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": int(episode.position),
                 "started": 0,
                 "total": int(episode.duration) if episode.duration else -1,
@@ -1379,7 +1552,7 @@ class Litepop:
                     "podcast": episode.podcast_url or episode.podcast_title,
                     "episode": episode.url,
                     "action": "download",
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "guid": episode.guid
                 })
             elif episode.position > 0 and episode != (self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None):
@@ -1388,7 +1561,7 @@ class Litepop:
                     "podcast": episode.podcast_url or episode.podcast_title,
                     "episode": episode.url,
                     "action": "play",
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "position": int(episode.position),
                     "started": 0,
                     "total": int(episode.duration) if episode.duration else -1,
@@ -1403,35 +1576,48 @@ class Litepop:
         episode.progress = 100.0
         episode.server_completed = True
 
-        # Set position to duration for completion
-        if episode.duration:
-            episode.position = episode.duration
+        # IMPORTANTE: Para marcar como completado en AntennaPod,
+        # la posición debe ser muy cercana al total
+        if episode.duration and episode.duration > 0:
+            # Poner position a 99% del total para asegurar que se marque como completado
+            final_position = int(episode.duration * 0.99)
+        else:
+            final_position = int(episode.position) if episode.position else 0
         
-        final_position = int(episode.duration or 0)
+        total_duration = int(episode.duration) if episode.duration and episode.duration > 0 else final_position
         
-        # Upload both download and final play action
+        # CRÍTICO: Enviar acción "play" con position muy cercano a total
+        # NO usar "download" porque AntennaPod no lo interpreta como completado
         actions = [
             {
-                "podcast": episode.podcast_url or episode.podcast_title,
+                "podcast": episode.podcast_url or episode.podcast_title or "",
                 "episode": episode.url,
-                "action": "play",
-                "timestamp": datetime.now().isoformat(),
+                "action": "play",  # Usar "play" no "download"
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": final_position,
-                "started": 0,
-                "total": final_position if final_position > 0 else -1,
+                "started": int(self.current_start_position),
+                "total": total_duration,
                 "guid": episode.guid if episode.guid else ""
             }
         ]
         
-        log(f"Uploading completion actions: position={final_position}, total={final_position}")
-    
-        if self.gpodder.upload_episode_actions(actions):
+        log(f"Uploading completion action: position={final_position}/{total_duration} ({(final_position/total_duration*100) if total_duration > 0 else 0:.1f}%)")
+
+        result = self.gpodder.upload_episode_actions(actions)
+        
+        if result and "error" not in result:
+            # Actualizar cache local
             self.episode_actions_cache[episode.url] = {
                 "progress": 100.0,
-                "position": int(episode.position) if episode.position else int(episode.duration or 0),
-                "total": int(episode.duration or -1),
-                "server_completed": True
+                "position": final_position,
+                "total": total_duration,
+                "server_completed": True,
+                "last_action": "play",
+                "last_timestamp": actions[0]["timestamp"]
             }
+            log(f"Episode marked as completed successfully")
+        else:
+            log(f"Error marking episode as completed: {result}")
         
         # Clean up the file after a short delay
         if episode.local_file:
@@ -1600,7 +1786,7 @@ class Litepop:
                 # Help text
                 help_row = height - 4
                 help_lines = [
-                    f"SPACE:Play/Pause | ENTER:Next | <-/->:Seek | d:Del | D:Del+Done | a:Add | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
+                    f"SPACE:Play/Pause | ENTER:Next | <-/->:Seek | d:Del | D:Del+Done | a:Add | v:Retry Download | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
                     "Status: [>>>]=Playing [II]=Paused [DWN]=Downloading [PND]=Pending [DON]=Done [ERR]=Error"
                 ]
                 for i, line in enumerate(help_lines):
@@ -1818,6 +2004,12 @@ class Litepop:
         
         # El archivo existe, reproducir
         if self.player.play(episode):
+            # Establecer posición inicial de sesión y duración si no está en el feed
+            self.current_start_position = episode.position
+            time.sleep(0.5)  # Espera breve para que mpv cargue metadata
+            duration = self.player.get_duration()
+            if duration > 0 and (not episode.duration or episode.duration <= 0):
+                episode.duration = duration
             self.current_index = index
             self.set_status_message(f"Playing: {episode.title}")
             self.needs_refresh.set()
@@ -1892,9 +2084,9 @@ class Litepop:
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
                 "action": "play",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": int(episode.position),
-                "started": 0,
+                "started": int(self.current_start_position),
                 "total": int(episode.duration) if episode.duration else -1,
                 "guid": episode.guid
             }
@@ -1915,11 +2107,11 @@ class Litepop:
             self.stdscr.refresh()
             time.sleep(0.5)
         
-        selected_index = 0
+        # selected_index = 0
         try:
             self.stdscr.timeout(100)
             while self.running:
-                self.draw_queue(selected_index)
+                self.draw_queue(self.selected_index)
                 
                 # Esperar evento de refresco o tecla
                 if self.needs_refresh.wait(timeout=0.1):
@@ -1932,24 +2124,34 @@ class Litepop:
                     continue
                 
                 if key == curses.KEY_UP:
-                    selected_index = max(0, selected_index - 1)
+                    self.selected_index = max(0, self.selected_index - 1)
                 elif key == curses.KEY_DOWN:
-                    selected_index = min(len(self.queue) - 1, selected_index + 1) if self.queue else 0
+                    self.selected_index = min(len(self.queue) - 1, self.selected_index + 1) if self.queue else 0
                 elif key == ord(' '):  # Space - play/pause/switch
-                    if self.queue and selected_index < len(self.queue):
-                        if self.current_index == selected_index:
+                    if self.queue and self.selected_index < len(self.queue):
+                        if self.current_index == self.selected_index:
                             if self.player.playing:
+                                episode = self.queue[self.current_index]
+                                episode.position = self.player.get_position()
+                                
                                 self.player.stop()
                                 self.set_status_message("Playback paused.")
+                                threading.Thread(target=self._sync_episode_position, args=(episode,), daemon=True).start()
                             else:
-                                if self.queue[selected_index].local_file:
-                                    self.player.play(self.queue[selected_index])
+                                if self.queue[self.selected_index].local_file:
+                                    self.player.play(self.queue[self.selected_index])
+                                    # Establecer posición inicial de sesión y duración si no está en el feed
+                                    self.current_start_position = self.queue[self.selected_index].position
+                                    time.sleep(0.5)  # Espera breve para que mpv cargue metadata
+                                    duration = self.player.get_duration()
+                                    if duration > 0 and (not self.queue[self.selected_index].duration or self.queue[self.selected_index].duration <= 0):
+                                        self.queue[self.selected_index].duration = duration
                                     self.set_status_message("Playback resumed.")
                                 else:
                                     self.set_status_message("Episode not downloaded yet.")
                         else:
-                            if self.queue[selected_index].local_file:
-                                self.play_selected(selected_index)
+                            if self.queue[self.selected_index].local_file:
+                                self.play_selected(self.selected_index)
                             else:
                                 self.set_status_message("Episode not downloaded yet.")
                 elif key in [curses.KEY_ENTER, 10, 13]:  # Enter - play next
@@ -1961,23 +2163,23 @@ class Litepop:
                     if self.player.seek(10):
                         self.set_status_message("Seeked +10s.")
                 elif key == ord('d'):  # Delete episode
-                    if self.queue and selected_index < len(self.queue):
-                        if self.delete_episode(selected_index):
-                            selected_index = min(selected_index, len(self.queue) - 1) if self.queue else 0
+                    if self.queue and self.selected_index < len(self.queue):
+                        if self.delete_episode(self.selected_index):
+                            self.selected_index = min(self.selected_index, len(self.queue) - 1) if self.queue else 0
                 elif key == ord('D'):  # Delete and mark as done
-                    if self.queue and selected_index < len(self.queue):
-                        if self.delete_and_mark_done(selected_index):
-                            selected_index = min(selected_index, len(self.queue) - 1) if self.queue else 0
+                    if self.queue and self.selected_index < len(self.queue):
+                        if self.delete_and_mark_done(self.selected_index):
+                            self.selected_index = min(self.selected_index, len(self.queue) - 1) if self.queue else 0
                 elif key == ord('a'):  # Add episodes
                     self.add_episodes_screen()
-                    selected_index = min(selected_index, len(self.queue) - 1) if self.queue else 0
+                    self.selected_index = min(self.selected_index, len(self.queue) - 1) if self.queue else 0
                 elif key == ord('s'):  # Change speed
                     speeds = {1.0: 1.5, 1.5: 1.75, 1.75: 2.0, 2.0: 0.5}
                     self.player.set_speed(speeds.get(self.player.speed, 1.0))
                     self.set_status_message(f"Speed set to {self.player.speed}x")
                 elif key == ord('R'):  # Reset progress
-                    if self.queue and selected_index < len(self.queue):
-                        episode = self.queue[selected_index]
+                    if self.queue and self.selected_index < len(self.queue):
+                        episode = self.queue[self.selected_index]
                         episode.position = 0
                         episode.completed = False
                         episode.server_completed = False
@@ -1988,7 +2190,7 @@ class Litepop:
                             "podcast": episode.podcast_url or episode.podcast_title,
                             "episode": episode.url,
                             "action": "play",
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "position": 0,
                             "started": 0,
                             "total": int(episode.duration) if episode.duration else -1,
@@ -2007,6 +2209,31 @@ class Litepop:
                                 "last_timestamp": action["timestamp"]
                             }
                         self.set_status_message(f"Progress reset and synced: {episode.title}")
+                elif key == ord('v'):  # Manually retry download
+                    if self.queue and self.selected_index < len(self.queue):
+                        episode = self.queue[self.selected_index]
+                        
+                        # Verificar si está descargando actualmente
+                        if self.download_manager.is_downloading(episode):
+                            self.set_status_message(f"Already downloading: {episode.title}")
+                        # Verificar si ya está descargado
+                        elif self.download_manager.is_downloaded(episode):
+                            self.set_status_message(f"Already downloaded: {episode.title}")
+                        else:
+                            # Iniciar o reintentar descarga
+                            error = self.download_manager.get_download_error(episode)
+                            if error:
+                                self.set_status_message(f"Retrying download: {episode.title}")
+                                self.download_manager.retry_download(
+                                    episode, 
+                                    callback=lambda ep: self._on_download_complete(ep)
+                                )
+                            else:
+                                self.set_status_message(f"Starting download: {episode.title}")
+                                self.download_manager.download_episode(
+                                    episode,
+                                    callback=lambda ep: self._on_download_complete(ep)
+                                )
                 elif key == ord('c'):  # Clear completed
                     self.clear_completed_episodes()
                 elif key == ord('r'):  # Manual sync
