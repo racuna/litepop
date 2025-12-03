@@ -161,86 +161,124 @@ class PodcastWrapped:
         """Analyze listening patterns and create wrapped summary"""
         print("🔍 Analyzing your listening patterns...")
         
-        # Group by podcast
-        podcast_stats = defaultdict(lambda: {
-            "episodes_played": 0,
-            "total_time_seconds": 0,
-            "completed_episodes": 0,
-            "episodes": [],
-            "listening_sessions": []
+        # Group by podcast AND episode to avoid double-counting
+        episode_stats = defaultdict(lambda: {
+            "podcast": "",
+            "max_position": 0,
+            "total_duration": 0,
+            "completed": False,
+            "play_count": 0,
+            "last_action": None
         })
         
-        total_listening_time = 0
+        podcast_episodes = defaultdict(set)  # Track unique episodes per podcast
         all_sessions = []
+        download_count = 0
         
         for action in actions:
             podcast_url = action.get("podcast", "")
+            episode_url = action.get("episode", "")
             action_type = action.get("action", "").lower()
             
-            if not podcast_url or action_type not in ["play", "download"]:
+            if not podcast_url or not episode_url:
                 continue
-            
+                
             # Get podcast metadata
             podcast_info = self.get_podcast_metadata(podcast_url)
             podcast_key = podcast_info["title"]
             
-            stats = podcast_stats[podcast_key]
+            # Create unique episode key
+            episode_key = f"{podcast_url}|{episode_url}"
             
-            if action_type == "play":
-                stats["episodes_played"] += 1
+            if action_type == "download":
+                download_count += 1
+                # Mark episode as downloaded but don't count as listening time
                 
-                # Calculate listening time - FIX: Handle None values
+            elif action_type == "play":
+                stats = episode_stats[episode_key]
+                stats["podcast"] = podcast_key
+                
+                # Track unique episodes per podcast
+                podcast_episodes[podcast_key].add(episode_key)
+                
+                # Get position data with proper None handling
                 position = action.get("position") or 0
                 total = action.get("total") or 0
-                started = action.get("started") or 0
                 
-                # Convert to integers, handling None/invalid values
                 try:
                     position = int(float(position)) if position is not None else 0
                     total = int(float(total)) if total is not None else 0
-                    started = int(float(started)) if started is not None else 0
                 except (ValueError, TypeError):
-                    position = started = total = 0
+                    position = total = 0
                 
-                if position > 0 and total > 0:
-                    listening_time = max(0, position - started)
-                    if listening_time > 0:
-                        stats["total_time_seconds"] += listening_time
-                        total_listening_time += listening_time
+                # Update max position for this episode
+                if position > stats["max_position"]:
+                    stats["max_position"] = position
+                    
+                # Update total duration
+                if total > stats["total_duration"]:
+                    stats["total_duration"] = total
                 
-                # Check if completed (98% threshold like litepop)
+                # Check completion (98% threshold)
                 if total > 0 and position > 0:
                     progress = (position / total) * 100
                     if progress >= 98:
-                        stats["completed_episodes"] += 1
+                        stats["completed"] = True
                 
-                # Store episode info
-                episode_data = {
-                    "url": action.get("episode", ""),
-                    "position": position,
-                    "total": total,
-                    "progress": (position / total * 100) if total > 0 else 0,
-                    "timestamp": action.get("timestamp", ""),
-                    "completed": progress >= 98 if total > 0 and position > 0 else False
-                }
-                stats["episodes"].append(episode_data)
+                stats["play_count"] += 1
                 
-                # Track listening session
+                # Track listening session time
                 if action.get("timestamp"):
                     try:
                         session_time = datetime.fromisoformat(action["timestamp"].replace('Z', '+00:00'))
                         all_sessions.append(session_time)
-                        stats["listening_sessions"].append(session_time)
+                        stats["last_action"] = session_time
                     except:
                         pass
         
-        # Calculate additional insights
-        insights = self.calculate_insights(podcast_stats, all_sessions, total_listening_time)
+        # Now calculate ACTUAL listening time
+        podcast_summary = defaultdict(lambda: {
+            "episodes_played": 0,
+            "total_time_seconds": 0,
+            "completed_episodes": 0,
+            "unique_episodes": set()
+        })
+        
+        total_listening_time = 0
+        
+        for episode_key, stats in episode_stats.items():
+            if stats["max_position"] > 0:  # Only count episodes that were actually played
+                podcast = stats["podcast"]
+                summary = podcast_summary[podcast]
+                
+                summary["episodes_played"] += 1
+                summary["unique_episodes"].add(episode_key)
+                
+                # Calculate listening time for this episode
+                listening_time = stats["max_position"]  # Use max position reached
+                summary["total_time_seconds"] += listening_time
+                total_listening_time += listening_time
+                
+                if stats["completed"]:
+                    summary["completed_episodes"] += 1
+        
+        # Convert sets to counts for JSON serialization
+        for podcast, summary in podcast_summary.items():
+            summary["unique_episodes"] = len(summary["unique_episodes"])
+        
+        print(f"📊 Found {len(episode_stats)} unique episodes")
+        print(f"🎧 Calculated listening time: {total_listening_time/3600:.1f} hours")
+        print(f"📥 Download actions: {download_count}")
+        
+        # Calculate insights
+        insights = self.calculate_insights(dict(podcast_summary), all_sessions, total_listening_time)
         
         return {
-            "podcast_stats": dict(podcast_stats),
+            "podcast_stats": dict(podcast_summary),
             "total_listening_time": total_listening_time,
             "total_sessions": len(all_sessions),
+            "unique_episodes": len(episode_stats),
+            "download_count": download_count,
             "insights": insights
         }
 
@@ -360,6 +398,8 @@ class PodcastWrapped:
         report.append(f"📅 Daily average: {insights['daily_average']} hours")
         report.append(f"🎵 Unique podcasts: {insights['unique_podcasts']}")
         report.append(f"▶️  Total episodes played: {insights['total_episodes_played']}")
+        report.append(f"📥 Total downloads: {analysis.get('download_count', 0)}")
+        report.append(f"🎧 Unique episodes: {analysis.get('unique_episodes', 0)}")
         report.append("")
         
         # Handle case where there's no listening data
@@ -423,27 +463,25 @@ class PodcastWrapped:
                 report.append(f"🔥 {streak['length']} days: {streak['start']} to {streak['end']}")
             report.append("")
         
-        # Fun facts
+        # Fun facts - updated to work without individual episode data
         report.append("🎯 FUN FACTS")
         report.append("-" * 15)
         
-        # Longest episode
-        longest_episode = None
-        longest_duration = 0
-        for podcast, stats in analysis["podcast_stats"].items():
-            for ep in stats["episodes"]:
-                if ep["total"] > longest_duration:
-                    longest_duration = ep["total"]
-                    longest_episode = (podcast, ep)
+        # Find podcast with highest average completion rate
+        if insights["top_completion_rates"]:
+            best_complete = insights["top_completion_rates"][0]
+            report.append(f"📈 Best completion rate: '{best_complete[0]}' at {best_complete[1]:.1f}%")
         
-        if longest_episode and longest_duration > 0:
-            hours = longest_duration / 3600
-            report.append(f"🕐 Longest episode: {hours:.1f} hours from '{longest_episode[0]}'")
+        # Find most active podcast
+        if insights["top_podcasts_by_episodes"]:
+            most_active = insights["top_podcasts_by_episodes"][0]
+            report.append(f"🎧 Most episodes: '{most_active[0]}' with {most_active[1]['episodes_played']} episodes")
         
-        # Most improved completion rate
-        if len(insights["top_completion_rates"]) > 1:
-            most_improved = insights["top_completion_rates"][0]
-            report.append(f"📈 Best completion rate: '{most_improved[0]}' at {most_improved[1]:.1f}%")
+        # Find longest listening podcast
+        if insights["top_podcasts_by_time"]:
+            longest = insights["top_podcasts_by_time"][0]
+            hours = longest[1]["total_time_seconds"] / 3600
+            report.append(f"⏱️  Most time: '{longest[0]}' with {hours:.1f} hours")
         
         return "\n".join(report)
 
