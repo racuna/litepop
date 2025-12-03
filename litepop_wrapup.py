@@ -167,12 +167,12 @@ class PodcastWrapped:
             "max_position": 0,
             "total_duration": 0,
             "completed": False,
-            "play_count": 0,
-            "last_action": None
+            "play_actions": [],  # Store all play actions for session calculation
+            "listening_sessions": []
         })
         
-        podcast_episodes = defaultdict(set)  # Track unique episodes per podcast
-        all_sessions = []
+        podcast_episodes = defaultdict(set)
+        all_raw_sessions = []  # All timestamped actions
         download_count = 0
         
         for action in actions:
@@ -192,7 +192,6 @@ class PodcastWrapped:
             
             if action_type == "download":
                 download_count += 1
-                # Mark episode as downloaded but don't count as listening time
                 
             elif action_type == "play":
                 stats = episode_stats[episode_key]
@@ -201,7 +200,7 @@ class PodcastWrapped:
                 # Track unique episodes per podcast
                 podcast_episodes[podcast_key].add(episode_key)
                 
-                # Get position data with proper None handling
+                # Get position data
                 position = action.get("position") or 0
                 total = action.get("total") or 0
                 
@@ -211,55 +210,87 @@ class PodcastWrapped:
                 except (ValueError, TypeError):
                     position = total = 0
                 
-                # Update max position for this episode
-                if position > stats["max_position"]:
-                    stats["max_position"] = position
-                    
-                # Update total duration
-                if total > stats["total_duration"]:
-                    stats["total_duration"] = total
-                
-                # Check completion (98% threshold)
-                if total > 0 and position > 0:
-                    progress = (position / total) * 100
-                    if progress >= 98:
-                        stats["completed"] = True
-                
-                stats["play_count"] += 1
-                
-                # Track listening session time
+                # Store the play action with timestamp for session grouping
                 if action.get("timestamp"):
                     try:
-                        session_time = datetime.fromisoformat(action["timestamp"].replace('Z', '+00:00'))
-                        all_sessions.append(session_time)
-                        stats["last_action"] = session_time
+                        action_time = datetime.fromisoformat(action["timestamp"].replace('Z', '+00:00'))
+                        
+                        # Group sessions that are close together (within 1 hour)
+                        # This prevents position updates from being separate sessions
+                        if stats["play_actions"]:
+                            last_action = stats["play_actions"][-1]
+                            time_diff = (action_time - last_action["time"]).total_seconds() / 3600  # hours
+                            
+                            if time_diff < 1:  # Same listening session
+                                # Just update the session end time and max position
+                                last_action["end_time"] = action_time
+                                last_action["max_position"] = max(last_action["max_position"], position)
+                            else:  # New session
+                                stats["play_actions"].append({
+                                    "time": action_time,
+                                    "end_time": action_time,
+                                    "position": position,
+                                    "max_position": position,
+                                    "total": total
+                                })
+                                all_raw_sessions.append(action_time)
+                        else:
+                            stats["play_actions"].append({
+                                "time": action_time,
+                                "end_time": action_time,
+                                "position": position,
+                                "max_position": position,
+                                "total": total
+                            })
+                            all_raw_sessions.append(action_time)
+                            
                     except:
                         pass
         
-        # Now calculate ACTUAL listening time
+        # Now calculate ACTUAL listening sessions and time
         podcast_summary = defaultdict(lambda: {
             "episodes_played": 0,
             "total_time_seconds": 0,
             "completed_episodes": 0,
+            "listening_sessions": 0,
             "unique_episodes": set()
         })
         
         total_listening_time = 0
+        actual_sessions = []  # Real listening sessions (not position updates)
         
         for episode_key, stats in episode_stats.items():
-            if stats["max_position"] > 0:  # Only count episodes that were actually played
-                podcast = stats["podcast"]
-                summary = podcast_summary[podcast]
+            if not stats["play_actions"]:  # Skip if no play actions
+                continue
                 
-                summary["episodes_played"] += 1
-                summary["unique_episodes"].add(episode_key)
+            podcast = stats["podcast"]
+            summary = podcast_summary[podcast]
+            
+            # Count unique episodes
+            summary["unique_episodes"].add(episode_key)
+            summary["episodes_played"] += 1
+            
+            # Calculate listening time and sessions for this episode
+            episode_listening_time = 0
+            for session in stats["play_actions"]:
+                # Use max position reached as listening time for this session
+                session_time = session["max_position"]
+                episode_listening_time += session_time
                 
-                # Calculate listening time for this episode
-                listening_time = stats["max_position"]  # Use max position reached
-                summary["total_time_seconds"] += listening_time
-                total_listening_time += listening_time
-                
-                if stats["completed"]:
+                # Count as one listening session
+                summary["listening_sessions"] += 1
+                actual_sessions.append(session["time"])
+            
+            summary["total_time_seconds"] += episode_listening_time
+            total_listening_time += episode_listening_time
+            
+            # Check if completed (98% threshold)
+            max_position = max(session["max_position"] for session in stats["play_actions"])
+            max_total = max(session["total"] for session in stats["play_actions"])
+            
+            if max_total > 0 and max_position > 0:
+                progress = (max_position / max_total) * 100
+                if progress >= 98:
                     summary["completed_episodes"] += 1
         
         # Convert sets to counts for JSON serialization
@@ -268,15 +299,16 @@ class PodcastWrapped:
         
         print(f"📊 Found {len(episode_stats)} unique episodes")
         print(f"🎧 Calculated listening time: {total_listening_time/3600:.1f} hours")
+        print(f"📻 Actual listening sessions: {len(actual_sessions)}")
         print(f"📥 Download actions: {download_count}")
         
         # Calculate insights
-        insights = self.calculate_insights(dict(podcast_summary), all_sessions, total_listening_time)
+        insights = self.calculate_insights(dict(podcast_summary), actual_sessions, total_listening_time)
         
         return {
             "podcast_stats": dict(podcast_summary),
             "total_listening_time": total_listening_time,
-            "total_sessions": len(all_sessions),
+            "total_sessions": len(actual_sessions),
             "unique_episodes": len(episode_stats),
             "download_count": download_count,
             "insights": insights
