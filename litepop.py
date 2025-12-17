@@ -22,6 +22,29 @@ from urllib.parse import urljoin
 from typing import List, Dict, Optional
 from pathlib import Path
 
+def get_utc_now() -> datetime:
+    """Get current UTC time compatible with Python 3.x and 3.13+"""
+    try:
+        # Python 3.11+
+        from datetime import UTC
+        return datetime.now(UTC)
+    except ImportError:
+        # Python 3.0-3.10
+        return datetime.utcnow()
+
+def rotate_log_if_needed(log_file: str, max_size_mb: int = 5) -> None:
+    """Rotate log file if it exceeds max size"""
+    log_path = Path(log_file)
+    if log_path.exists():
+        size_mb = log_path.stat().st_size / (1024 * 1024)
+        if size_mb > max_size_mb:
+            # Keep last 1000 lines only
+            try:
+                lines = log_path.read_text().splitlines()
+                log_path.write_text('\n'.join(lines[-1000:]) + '\n')
+            except Exception:
+                log_path.write_text("")  # Clear if rotation fails
+
 def log(msg: str, log_file: Optional[str] = None) -> None:
     """Global logging function"""
     if log_file is None:
@@ -41,6 +64,8 @@ def log(msg: str, log_file: Optional[str] = None) -> None:
     msg_lower = msg.lower().strip()
     if msg_lower in ['{}', '}', '{', '[]', 'none', '']:
         return  # Don't log empty/meaningless messages
+        
+    rotate_log_if_needed(log_file)
     
     with open(log_file, "a") as f:
         f.write(f"{datetime.now()}: {msg}\n")
@@ -1091,6 +1116,7 @@ class Litepop:
         self.last_log_line = ""
         self.current_start_position = 0
         self.episode_actions_cache = {}
+        self.max_cache_entries = 500
         self.ui_refresh_lock = threading.Lock()
         self.needs_refresh = threading.Event()
         self.initial_sync_done = False
@@ -1108,7 +1134,12 @@ class Litepop:
         curses.noecho()
         curses.cbreak()
         self.stdscr.keypad(True)
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            # Some terminals (like xterm) may not support cursor visibility changes
+            log("Warning: Terminal does not support cursor visibility control")
+            pass
         curses.start_color()
         curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_WHITE)
@@ -1135,9 +1166,9 @@ class Litepop:
                 if log_file.exists():
                     lines = log_file.read_text().splitlines()
                     self.last_log_line = lines[-1].strip() if lines else ""
-                time.sleep(0.5)
+                time.sleep(2.0)
             except Exception:
-                time.sleep(1)
+                time.sleep(2.0)
 
     def _position_sync_worker(self) -> None:
         """Syncs playback position to gPodder every 30 seconds"""
@@ -1455,6 +1486,16 @@ class Litepop:
                 log(f"Episode downloaded (not necessarily completed): {episode_url}")
                 
             log(f"Updated cache for {episode_url}: pos={cache_entry['position']}, progress={cache_entry['progress']:.1f}%, completed={cache_entry['server_completed']}")
+            
+        if len(self.episode_actions_cache) > self.max_cache_entries:
+            # Ordenar por timestamp y mantener solo las más recientes
+            sorted_entries = sorted(
+                self.episode_actions_cache.items(),
+                key=lambda x: x[1].get("last_timestamp", ""),
+                reverse=True
+            )
+            self.episode_actions_cache = dict(sorted_entries[:self.max_cache_entries])
+            log(f"Cache trimmed to {self.max_cache_entries} entries")
 
     def _get_episode_server_status(self, episode_url: str) -> Dict:
         """Gets episode status from cache"""
@@ -1538,7 +1579,7 @@ class Litepop:
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
                 "action": "play",
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": int(episode.position),
                 "started": 0,
                 "total": int(episode.duration) if episode.duration else -1,
@@ -1552,7 +1593,7 @@ class Litepop:
                     "podcast": episode.podcast_url or episode.podcast_title,
                     "episode": episode.url,
                     "action": "download",
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "guid": episode.guid
                 })
             elif episode.position > 0 and episode != (self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None):
@@ -1561,7 +1602,7 @@ class Litepop:
                     "podcast": episode.podcast_url or episode.podcast_title,
                     "episode": episode.url,
                     "action": "play",
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "position": int(episode.position),
                     "started": 0,
                     "total": int(episode.duration) if episode.duration else -1,
@@ -1593,7 +1634,7 @@ class Litepop:
                 "podcast": episode.podcast_url or episode.podcast_title or "",
                 "episode": episode.url,
                 "action": "play",  # Usar "play" no "download"
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": final_position,
                 "started": int(self.current_start_position),
                 "total": total_duration,
@@ -1786,7 +1827,7 @@ class Litepop:
                 # Help text
                 help_row = height - 4
                 help_lines = [
-                    f"SPACE:Play/Pause | ENTER:Next | <-/->:Seek | d:Del | D:Del+Done | a:Add | v:Retry Download | s:Speed({self.player.speed}x) | R:Reset | q:Quit",
+                    f"SPACE:Play/Pause | ENTER:Next | <-/->:Seek | d:Del | D:Del+Done | a:Add | v:Re-Download | s:Speed({self.player.speed}x) | r: reload | R:Reset | q:Quit",
                     "Status: [>>>]=Playing [II]=Paused [DWN]=Downloading [PND]=Pending [DON]=Done [ERR]=Error"
                 ]
                 for i, line in enumerate(help_lines):
@@ -2084,7 +2125,7 @@ class Litepop:
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
                 "action": "play",
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "position": int(episode.position),
                 "started": int(self.current_start_position),
                 "total": int(episode.duration) if episode.duration else -1,
@@ -2190,7 +2231,7 @@ class Litepop:
                             "podcast": episode.podcast_url or episode.podcast_title,
                             "episode": episode.url,
                             "action": "play",
-                            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "position": 0,
                             "started": 0,
                             "total": int(episode.duration) if episode.duration else -1,
