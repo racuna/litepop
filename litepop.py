@@ -1166,9 +1166,9 @@ class Litepop:
                 if log_file.exists():
                     lines = log_file.read_text().splitlines()
                     self.last_log_line = lines[-1].strip() if lines else ""
-                time.sleep(2.0)
+                time.sleep(5.0)
             except Exception:
-                time.sleep(2.0)
+                time.sleep(5.0)
 
     def _position_sync_worker(self) -> None:
         """Syncs playback position to gPodder every 30 seconds"""
@@ -1678,7 +1678,7 @@ class Litepop:
         """Draws playback queue UI"""
         with self.ui_refresh_lock:
             try:
-                self.stdscr.clear()
+                self.stdscr.erase()
                 self.draw_header()
                 height, width = self.stdscr.getmaxyx()
                 
@@ -1907,7 +1907,7 @@ class Litepop:
 
         scroll_offset = 0
         while True:
-            self.stdscr.clear()
+            self.stdscr.erase()
             self.draw_header()
             self.stdscr.addstr(2, 2, "Add Episodes (Press ENTER to add, ESC to return)")
             visible_items = height - 7
@@ -2150,12 +2150,12 @@ class Litepop:
         
         # selected_index = 0
         try:
-            self.stdscr.timeout(100)
+            self.stdscr.timeout(250)
             while self.running:
                 self.draw_queue(self.selected_index)
                 
                 # Esperar evento de refresco o tecla
-                if self.needs_refresh.wait(timeout=0.1):
+                if self.needs_refresh.wait(timeout=0.25):
                     self.needs_refresh.clear()
                     continue  # Refrescar inmediatamente
                 
