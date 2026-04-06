@@ -71,6 +71,7 @@ initial_days_back = 90
 temp_dir = /tmp/litepop
 log_file = /tmp/litepop/litepop.log
 default_speed = 1.0
+available_speeds = 1.0, 1.5, 1.75, 2.0, 0.5
 player_command = mpv --no-config --no-video --af=loudnorm=i=-16:lra=11:tp=-1.5 --speed={speed} --start={start_time} --input-ipc-server={ipc_socket} {file}
 ```
 
