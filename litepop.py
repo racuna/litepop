@@ -1438,11 +1438,27 @@ class Litepop:
 
             for thread in threads:
                 thread.join()
-
+                
+            # NUEVO: Forzar limpieza de referencias antiguas y validar que feeds aún existen
+            current_sub_urls = {feed.url for feed in new_feeds}
+            old_queue_len = len(self.queue)
+            
+            # Eliminar de la cola episodios de feeds que ya no están suscritos
+            self.queue = [ep for ep in self.queue if ep.podcast_url in current_sub_urls]
+            
+            # Validar índice actual y estado del reproductor
+            if not self.queue:
+                self.current_index = -1
+                self.player.stop()
+            elif self.current_index >= len(self.queue):
+                # El índice apuntaba a un episodio eliminado o quedó desfasado
+                self.current_index = -1
+                self.player.stop()
+                
             self.subscriptions = new_feeds
             self.last_sync = datetime.now()
             self._load_auto_queue()
-            log(f"Sync completed: {len(new_feeds)} feeds loaded")
+            log(f"Sync completed: {len(new_feeds)} feeds loaded. Queue sanitized: {old_queue_len - len(self.queue)} episodes removed.")
             self.needs_refresh.set()
             return True
             
@@ -1883,18 +1899,27 @@ class Litepop:
         height, width = self.stdscr.getmaxyx()
         selected = 0
         all_episodes = []
+        seen_episode_urls = set()
     
         # Collect all episodes not already in queue
         for feed in self.subscriptions:
             for episode in feed.episodes:
-                if not any(ep.url == episode["url"] for ep in self.queue):
-                    episode_obj = Episode(episode)
-                    server_status = self._get_episode_server_status(episode_obj.url)
-                    # CORRECCIÓN: Determinar completado basado en progreso
-                    episode_obj.server_completed = server_status.get("progress", 0.0) >= 98.0
-                    episode_obj.progress = server_status.get("progress", 0.0)
-                    episode_obj.position = server_status.get("position", 0)
-                    all_episodes.append(episode_obj)
+                ep_url = episode["url"]
+                
+                # 1. Saltar si ya está en la cola O si ya lo procesamos en este recorrido
+                if any(ep.url == ep_url for ep in self.queue) or ep_url in seen_episode_urls:
+                    continue
+
+                episode_obj = Episode(episode)
+                server_status = self._get_episode_server_status(episode_obj.url)
+                
+                # CORRECCIÓN: Determinar completado basado en progreso
+                episode_obj.server_completed = server_status.get("progress", 0.0) >= 98.0
+                episode_obj.progress = server_status.get("progress", 0.0)
+                episode_obj.position = server_status.get("position", 0)
+                
+                all_episodes.append(episode_obj)
+                seen_episode_urls.add(ep_url)
 
         # Sort by publication date
         all_episodes.sort(key=lambda ep: email.utils.parsedate_to_datetime(ep.pub_date).timestamp() if ep.pub_date else 0, reverse=True)
