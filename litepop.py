@@ -99,6 +99,7 @@ class Config:
             "temp_dir": "/tmp/litepop",
             "log_file": "/tmp/litepop/litepop_debug.log",
             "default_speed": "1.0",
+            "available_speeds": "1.0, 1.5, 1.75, 2.0, 0.5",
             "player_command": "mpv --no-config --no-video --af=loudnorm=i=-16:lra=11:tp=-1.5 --speed={speed} --start={start_time} --input-ipc-server={ipc_socket} {file}"
         }
         self.save_config()
@@ -292,17 +293,23 @@ class GPodderSync:
             log(f"Raw subscriptions response: {data}")
 
             # Handle different response formats
-            if isinstance(data, dict):
-                if "add" in data:
-                    subscriptions = data.get("add", [])
-                elif "subscriptions" in data:
+            if isinstance(data, list):
+                # Formato correcto: lista plana de URLs
+                subscriptions = [item for item in data if isinstance(item, str)]
+            elif isinstance(data, dict):
+                # Podría ser formato de cambios incrementales {"add": [...], "timestamp": ...}
+                # En ese caso "add" NO es la lista completa de suscripciones actuales
+                # Solo lo usamos si no hay otra opción
+                if "subscriptions" in data:
                     subscriptions = data.get("subscriptions", [])
                 elif "data" in data:
                     subscriptions = [v for v in data.get("data", []) if isinstance(v, str)]
+                elif "add" in data and isinstance(data.get("add"), list):
+                    # ADVERTENCIA: esto puede ser incompleto si el servidor devuelve cambios
+                    log("WARNING: subscriptions response uses 'add' format - may be incomplete")
+                    subscriptions = data.get("add", [])
                 else:
                     subscriptions = []
-            elif isinstance(data, list):
-                subscriptions = data
             else:
                 subscriptions = []
 
@@ -1012,9 +1019,12 @@ class Player:
             self.position_monitor_thread.start()
 
             def monitor_player():
-                stdout, stderr = self.process.communicate()
-                if self.process and self.process.returncode != 0:
-                    log(f"Error in mpv (code {self.process.returncode}):\nSTDOUT: {stdout.decode('utf-8', errors='ignore')}\nSTDERR: {stderr.decode('utf-8', errors='ignore')}")
+                proc = self.process  # Capturar referencia local
+                if proc is None:
+                    return
+                stdout, stderr = proc.communicate()
+                if proc and proc.returncode != 0:
+                    log(f"Error in mpv (code {proc.returncode}):\nSTDOUT: {stdout.decode('utf-8', errors='ignore')}\nSTDERR: {stderr.decode('utf-8', errors='ignore')}")
                 self.playing = False
                 if self.ipc_socket and Path(self.ipc_socket).exists():
                     Path(self.ipc_socket).unlink(missing_ok=True)
@@ -1390,6 +1400,11 @@ class Litepop:
             
             # Get subscriptions
             subscriptions = self.gpodder.get_subscriptions()
+            
+            # NUEVO: Eliminar duplicados manteniendo el orden original
+            subscriptions = list(dict.fromkeys(subscriptions))
+            if len(subscriptions) < len(self.gpodder.subscriptions_cache):
+                log(f"Deduplicated subscriptions: removed {len(self.gpodder.subscriptions_cache) - len(subscriptions)} duplicates")
             
             # If we already have subscriptions and get empty result, just refresh existing feeds
             if not subscriptions and self.subscriptions:
@@ -2062,6 +2077,7 @@ class Litepop:
     def play_next(self) -> bool:
         """Plays next episode in queue"""
         if self.current_index + 1 < len(self.queue):
+            self.selected_index = self.current_index + 1
             return self.play_selected(self.current_index + 1)
         self.player.stop()
         self.set_status_message("End of queue.")
@@ -2116,6 +2132,10 @@ class Litepop:
         if self.current_index >= len(self.queue):
             self.current_index = -1
             self.player.stop()
+        if 0 <= self.current_index < len(self.queue):
+            self.selected_index = self.current_index
+        else:
+            self.selected_index = 0
         self.set_status_message(f"Cleaned up {initial_len - len(self.queue)} completed episodes.")
 
     def _sync_episode_position(self, episode: Episode) -> None:
@@ -2215,8 +2235,29 @@ class Litepop:
                     self.add_episodes_screen()
                     self.selected_index = min(self.selected_index, len(self.queue) - 1) if self.queue else 0
                 elif key == ord('s'):  # Change speed
-                    speeds = {1.0: 1.5, 1.5: 1.75, 1.75: 2.0, 2.0: 0.5}
-                    self.player.set_speed(speeds.get(self.player.speed, 1.0))
+                    # Intentar leer lista de velocidades desde el archivo de configuración
+                    _speeds_raw = self.config.get("player", "available_speeds", fallback=None)
+                    _speeds_list = None
+                    if _speeds_raw:
+                        try:
+                            # Parsear la lista: "1.0, 1.5, 1.75, 2.0, 0.5" -> [1.0, 1.5, 1.75, 2.0, 0.5]
+                            _parsed = [float(x.strip()) for x in _speeds_raw.split(",")]
+                            # Validar: mínimo 2 valores, todos positivos
+                            if len(_parsed) >= 2 and all(v > 0 for v in _parsed):
+                                _speeds_list = _parsed
+                        except (ValueError, AttributeError):
+                            pass  # Lista malformada: se usará la del código
+                    
+                    if _speeds_list:
+                        # Usar la lista del archivo de configuración
+                        _speeds_dict = {_speeds_list[i]: _speeds_list[i + 1] for i in range(len(_speeds_list) - 1)}
+                        _speeds_dict[_speeds_list[-1]] = _speeds_list[0]  # El último vuelve al primero
+                        speeds = _speeds_dict
+                    else:
+                        # Usar la lista hardcodeada (comportamiento original)
+                        speeds = {1.0: 1.5, 1.5: 1.75, 1.75: 2.0, 2.0: 0.5}
+                    
+                    self.player.set_speed(speeds.get(self.player.speed, _speeds_list[0] if _speeds_list else 1.0))
                     self.set_status_message(f"Speed set to {self.player.speed}x")
                 elif key == ord('R'):  # Reset progress
                     if self.queue and self.selected_index < len(self.queue):
