@@ -17,6 +17,8 @@ import hashlib
 import xml.etree.ElementTree as ET
 import socket
 import email.utils
+import sys
+import traceback
 from datetime import datetime, date  # Explicitly import date
 from urllib.parse import urljoin
 from typing import List, Dict, Optional
@@ -69,6 +71,18 @@ def log(msg: str, log_file: Optional[str] = None) -> None:
     
     with open(log_file, "a") as f:
         f.write(f"{datetime.now()}: {msg}\n")
+
+# ─────────────────────────────────────────────────────────────
+# REDIRECCIÓN DE EXCEPCIONES DE HILOS AL ARCHIVO DE LOG
+# ─────────────────────────────────────────────────────────────
+def _thread_excepthook(args):
+    """Intercepta cualquier excepción no manejada en un hilo y la guarda en el log"""
+    try:
+        tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        log(f"⚠️ Unhandled thread exception:\n{tb}")
+    except Exception:
+        pass  # Evita bucles si el sistema de log falla
+threading.excepthook = _thread_excepthook
 
 class Config:
     """Handles configuration file operations"""
@@ -134,11 +148,49 @@ class GPodderSync:
         log(f"Initialized {self.backend} backend with URL: {self.server_url}")
 
         # Resolve device_id "default" for opodsync
+        # Resolve device_id "default" for opodsync
         try:
-            self._resolve_device_id()
-            self._verify_device_registration()
+            if self.backend == "opodsync":
+                # ✅ Verificar que el login inicial funcione
+                if not self._login():
+                    log("⚠️ Initial login failed, continuing with basic auth only")
+                self._resolve_device_id()
+                self._verify_device_registration()
         except Exception as e:
             log(f"Could not resolve device_id: {str(e)}")
+            
+    def _refresh_session(self) -> None:
+        """Crea una sesión nueva y limpia para evitar cookies expiradas"""
+        log("Refreshing requests session (clearing old cookies)")
+        self.session = requests.Session()
+        self.session.auth = (self.username, self.password)
+        self.session.headers.update({"User-Agent": "litepop/1.0"})
+            
+    def _login(self) -> bool:
+        """Explicitly log in to OPodSync to get a fresh session cookie"""
+        try:
+            # 🔄 IMPORTANTE: Limpiar sesión antes de login para evitar cookies expiradas
+            self._refresh_session()
+            
+            url = urljoin(self.server_url, f"api/2/auth/{self.username}/login.json")
+            log(f"Logging in to OPodSync at: {url}")
+            
+            resp = self.session.post(
+                url,
+                auth=(self.username, self.password),
+                headers={"User-Agent": "litepop/1.0"},
+                timeout=15
+            )
+            
+            if resp.status_code == 200:
+                log("✅ OPodSync login successful, fresh session cookie obtained")
+                return True
+            else:
+                log(f"❌ OPodSync login failed: HTTP {resp.status_code} - {resp.text[:200]}")
+                return False
+        except Exception as e:
+            log(f"❌ Error during OPodSync login: {str(e)}")
+            return False
 
     def _cleanup_duplicate_devices(self) -> None:
         """Merge duplicate devices by updating them all with the same data"""
@@ -239,9 +291,11 @@ class GPodderSync:
                         # Registrar el device
                         self._register_device()
             else:
-                # Para nextcloud, no necesitamos device_id específico
-                self.device_id = "litepop"
-                log(f"Using default device_id for nextcloud: {self.device_id}")
+                # Para nextcloud y gpodder.net, usar un device_id real
+                import socket
+                hostname = socket.gethostname().replace(" ", "-")
+                self.device_id = f"litepop-{hostname}"
+                log(f"Using device_id for {self.backend}: {self.device_id}")
                 
         except Exception as e:
             log(f"Could not resolve device id: {str(e)}")
@@ -276,7 +330,7 @@ class GPodderSync:
         try:
             if self.backend == "nextcloud":
                 url = urljoin(self.server_url, "subscription")
-            elif self.backend == "opodsync":
+            elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"subscriptions/{self.username}/{self.device_id}.json")
             else:
                 raise ValueError(f"Unknown backend: {self.backend}")
@@ -326,7 +380,7 @@ class GPodderSync:
         try:
             if self.backend == "nextcloud":
                 url = urljoin(self.server_url, "episode_action")
-            elif self.backend == "opodsync":
+            elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"api/2/episodes/{self.username}.json")
             else:
                 raise ValueError(f"Unknown backend: {self.backend}")
@@ -494,7 +548,10 @@ class GPodderSync:
                             dt = datetime.now()
                     
                         # Formato ISO: opodsync prefiere con Z, Nextcloud acepta ambos
-                        if self.backend == "opodsync":
+                        if self.backend == "gpodder":
+                            # gpodder.net oficial requiere Unix timestamp entero
+                            formatted_action["timestamp"] = int(dt.timestamp())
+                        elif self.backend == "opodsync":
                             formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                         else:
                             # Nextcloud acepta sin Z también
@@ -503,10 +560,16 @@ class GPodderSync:
                     except Exception as e:
                         log(f"Error formatting timestamp {timestamp}: {str(e)}")
                         dt = datetime.now()
-                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if self.backend == "gpodder":
+                            formatted_action["timestamp"] = int(dt.timestamp())
+                        else:
+                            formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 else:
                     dt = datetime.now()
-                    formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if self.backend == "gpodder":
+                        formatted_action["timestamp"] = int(dt.timestamp())
+                    else:
+                        formatted_action["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             
                 # CRÍTICO: device es obligatorio para opodsync, opcional para Nextcloud
                 if self.backend == "opodsync":
@@ -562,7 +625,7 @@ class GPodderSync:
             # Choose the correct endpoint
             if self.backend == "nextcloud":
                 url = urljoin(self.server_url, "episode_action/create")
-            elif self.backend == "opodsync":
+            elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"api/2/episodes/{self.username}.json")
             else:
                 raise ValueError(f"Unknown backend: {self.backend}")
@@ -620,16 +683,53 @@ class GPodderSync:
         except requests.exceptions.HTTPError as e:
             log(f"HTTP error uploading episode actions: {str(e)}")
             if hasattr(e, 'response') and e.response is not None:
-                log(f"Response status: {e.response.status_code}")
+                status = e.response.status_code
+                log(f"Response status: {status}")
                 try:
                     log(f"Response content: {e.response.text}")
                 except:
                     log(f"Response content (bytes): {e.response.content}")
-            return {"error": str(e)}
-        except Exception as e:
-            log(f"Error uploading episode actions: {str(e)}")
-            import traceback
-            log(f"Traceback: {traceback.format_exc()}")
+                
+                # Si es 400 o 401 y estamos en opodsync, puede ser sesión expirada
+                # Intentar re-login y reintentar UNA vez
+                if status in (400, 401) and self.backend == "opodsync":
+                    error_text = ""
+                    try:
+                        error_text = e.response.text.lower() if e.response else ""
+                    except:
+                        pass
+                    
+                    if "invalid sessionid" in error_text or status == 401:
+                        log("🔄 Session expired, attempting re-login with fresh session...")
+                        
+                        # Forzar refresh de sesión antes de re-login
+                        self._refresh_session()
+                        
+                        if self._login():
+                            log("✅ Re-login successful, retrying upload...")
+                            try:
+                                resp2 = self.session.post(
+                                    url,
+                                    headers=headers,
+                                    json=formatted_actions,
+                                    timeout=30,
+                                )
+                                log(f"Retry response status: {resp2.status_code}")
+                                resp2.raise_for_status()
+                                if resp2.content:
+                                    try:
+                                        return resp2.json()
+                                    except ValueError:
+                                        return {"status": "success"}
+                                return {"status": "success"}
+                            except Exception as retry_e:
+                                log(f"❌ Retry after re-login also failed: {str(retry_e)}")
+                                return {"error": str(retry_e)}
+                        else:
+                            log("❌ Re-login failed, cannot upload actions")
+                            return {"error": "Re-login failed"}
+                    
+                    return {"error": str(e)}
             return {"error": str(e)}
 
 class PodcastFeed:
@@ -2365,6 +2465,15 @@ class Litepop:
             
             self.download_manager.cleanup_all_files()
             self.cleanup_curses()
+
+# ─────────────────────────────────────────────────────────────
+# SILENCIAR LOGS DE RED QUE A VECES SE FILTRAN A LA TERMINAL
+# ─────────────────────────────────────────────────────────────
+import logging
+# Subir el nivel de log de urllib3 y requests a CRITICAL
+# Esto evita que warnings/connection messages se impriman por stderr
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("requests").setLevel(logging.CRITICAL)
 
 if __name__ == "__main__":
     try:
