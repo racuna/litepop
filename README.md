@@ -79,23 +79,6 @@ player_command = mpv --no-config --no-video --af=loudnorm=i=-16:lra=11:tp=-1.5 -
 
 Contributions are very welcome! Here are some ideas where help is needed:
 
-* ✅ **Internal MP3 player in Python**
-  Replace `mpv` with an internal player for MP3 files that supports:
-
-  * Playback progress tracking
-  * Seek with ← and → keys (±10s)
-  * Pitch-preserving speed variation
-    Keep `mpv` as fallback for non-MP3 formats.
-
-* ✅ **Display "Downloading, wait" message**
-  When an item is selected but not yet downloaded, display a clear message to prevent user confusion.
-
-* ✅ **Subscription management from UI**
-  Add support for:
-
-  * Adding a new subscription from an RSS URL
-  * Removing an existing subscription
-  * Syncing these changes to the gPodder server
 
 * ✅ **Code optimization and cleanup**
 
