@@ -783,10 +783,10 @@ class GPodderSync:
 
             # Choose the correct endpoint
             if self.backend == "nextcloud":
-                # ✅ gpoddersync: POST a esta ruta para crear acciones
+                # ✅ gpoddersync requiere /create para POST
                 base = self.server_url.rstrip('/')
-                url = f"{base}/index.php/apps/gpoddersync/episode_action"
-                # Nota: gpoddersync usa POST a la misma URL que GET, no /create
+                url = f"{base}/index.php/apps/gpoddersync/episode_action/create"
+                log(f"Nextcloud-gpoddersync upload URL: {url}")
             elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"api/2/episodes/{self.username}.json")
             else:
@@ -812,7 +812,7 @@ class GPodderSync:
                 "Accept": "application/json"
             }
             
-            payload = formatted_actions if self.backend == "nextcloud" else {"actions": formatted_actions}
+            payload = formatted_actions  # Lista directa
         
             # Make the request
             resp = self.session.post(
