@@ -143,6 +143,12 @@ class GPodderSync:
 
         self.session = requests.Session()
         self.session.auth = (self.username, self.password)
+        self.session.headers.update({
+            "User-Agent": "litepop/1.0 (Terminal Podcast Client; +https://github.com/usuario/litepop)",
+            "Accept": "application/json",
+            "Connection": "keep-alive"
+        })
+        log(f"Session headers configured for {self.backend}")
         self.episode_actions_cache: List[Dict] = []
         self.subscriptions_cache: List[str] = []
         log(f"Initialized {self.backend} backend with URL: {self.server_url}")
@@ -174,6 +180,10 @@ class GPodderSync:
             
             url = urljoin(self.server_url, f"api/2/auth/{self.username}/login.json")
             log(f"Logging in to OPodSync at: {url}")
+            
+            # DEBUG: Mostrar exactamente qué se está enviando
+            log(f"DEBUG: Enviando acciones a {url}")
+            log(f"DEBUG: Payload: {json.dumps(formatted_actions, indent=2)}")
             
             resp = self.session.post(
                 url,
@@ -255,6 +265,13 @@ class GPodderSync:
                 resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=15)
                 resp.raise_for_status()
                 
+                if self.backend == "gpodder":
+                    # Patrón requerido: ^[\w.-]+$ (solo palabras, puntos, guiones)
+                    if not re.match(r'^[\w.-]+$', self.device_id):
+                        log(f"⚠️ Device-ID '{self.device_id}' no cumple formato gpodder.net")
+                        # Sanitizar: reemplazar caracteres inválidos
+                        self.device_id = re.sub(r'[^a-zA-Z0-9._-]', '-', self.device_id)
+                        log(f"✅ Device-ID sanitizado: '{self.device_id}'")
                 if resp.ok and resp.content:
                     data = resp.json()
                     log(f"Devices response: {data}")
@@ -307,6 +324,26 @@ class GPodderSync:
     def _register_device(self) -> None:
         """Register a new device with opodsync"""
         try:
+            if self.backend == "gpodder":
+                # gpodder.net usa endpoint diferente para registrar dispositivos
+                url = urljoin(self.server_url, f"api/2/devices/{self.username}/{self.device_id}.json")
+                data = {
+                    "caption": "litepop Terminal Player",
+                    "type": "desktop"  # Valores válidos: desktop, laptop, mobile, server, other
+                }
+                resp = self.session.post(
+                    url, 
+                    json=data, 
+                    headers={"User-Agent": "litepop/1.0", "Accept": "application/json"},
+                    timeout=15
+                )
+                
+                # gpodder.net puede devolver 200 (OK) o 204 (No Content) al registrar
+                if resp.status_code in (200, 204, 409):  # 409 = ya existe
+                    log(f"✅ Device '{self.device_id}' registrado/verificado en gpodder.net")
+                    return
+                else:
+                    log(f"⚠️ Registro de dispositivo: HTTP {resp.status_code} - {resp.text[:100]}")
             if self.backend == "opodsync":
                 url = urljoin(self.server_url, f"api/2/devices/{self.username}/{self.device_id}.json")
                 data = {
@@ -323,27 +360,130 @@ class GPodderSync:
                 resp.raise_for_status()
                 log(f"Device registered successfully: {self.device_id}")
         except Exception as e:
-            log(f"Could not register device: {str(e)}")
+            log(f"❌ Error registrando dispositivo: {str(e)}")
+            # NO fallar completamente: continuar con device_id genérico
+            import socket
+            self.device_id = f"litepop-{socket.gethostname()}"[:50]  # Limitar longitud
 
     def get_subscriptions(self) -> List[str]:
         """Get subscriptions from server"""
         try:
             if self.backend == "nextcloud":
-                url = urljoin(self.server_url, "subscription")
-            elif self.backend in ("opodsync", "gpodder"):
+                #✅ gpoddersync usa esta ruta exacta
+                base = self.server_url.rstrip('/')
+                url = f"{base}/index.php/apps/gpoddersync/subscriptions"
+                log(f"Nextcloud-gpoddersync subscriptions URL: {url}")
+            # ✅ Código corregido
+            elif self.backend == "opodsync":
+                # Opodsync usa ruta sin formato explícito
                 url = urljoin(self.server_url, f"subscriptions/{self.username}/{self.device_id}.json")
+            elif self.backend == "gpodder":
+                # Intentar primero con ruta estándar
+                url = urljoin(self.server_url, f"subscriptions/{self.username}/{self.device_id}.json")
+                log(f"Trying gpodder endpoint: {url}")
+                
+                resp = self.session.get(
+                    url,
+                    auth=(self.username, self.password),
+                    headers={"User-Agent": "litepop/1.0 (Terminal Podcast Client)"},
+                    timeout=30
+                )
+                
+                # Si falla con 404 o 403, intentar con prefijo /api/2/
+                if resp.status_code in (403, 404):
+                    alt_url = urljoin(self.server_url, f"api/2/subscriptions/{self.username}/{self.device_id}.json")
+                    log(f"Trying alternative endpoint: {alt_url}")
+                    resp = self.session.get(
+                        alt_url,
+                        auth=(self.username, self.password),
+                        headers={"User-Agent": "litepop/1.0 (Terminal Podcast Client)"},
+                        timeout=30
+                    )
             else:
                 raise ValueError(f"Unknown backend: {self.backend}")
 
             log(f"Fetching subscriptions from: {url}")
-            resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=30)
+            if self.backend == "gpodder":
+                # Forzar auth explícita en cada petición para gpodder.net
+                resp = self.session.get(
+                    url, 
+                    auth=(self.username, self.password),  # ← IMPORTANTE
+                    headers={
+                        "User-Agent": "litepop/1.0 (Terminal Podcast Client)",  # ← Más descriptivo
+                        "Accept": "application/json"
+                    }, 
+                    timeout=30
+                )
+            else:
+                # Para opodsync/nextcloud, mantener comportamiento original
+                resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=30)
+            # Manejar errores específicos de gpodder.net
+            if resp.status_code == 401:
+                log("❌ Error 401: Credenciales inválidas o sesión expirada")
+                # Intentar re-login si es gpodder.net
+                if self.backend == "gpodder" and hasattr(self, '_login'):
+                    if self._login():
+                        log("🔄 Re-login exitoso, reintentando...")
+                        resp = self.session.get(url, headers={"User-Agent": "litepop/1.0"}, timeout=30)
+                    else:
+                        log("❌ Re-login fallido")
+                return []
+
+            elif resp.status_code == 404:
+                log(f"❌ Error 404: Dispositivo '{self.device_id}' no encontrado en gpodder.net")
+                log("💡 Sugerencia: El device_id debe coincidir con uno registrado en tu cuenta")
+                return []
+
+            elif resp.status_code == 400:
+                log("❌ Error 400: Formato de solicitud inválido")
+                log(f"💡 URL usada: {url}")
+                return []
             resp.raise_for_status()
+            if resp.status_code == 403:
+                log("❌ Error 403: Acceso denegado. Posibles causas:")
+                log("   • Credenciales incorrectas o expiradas")
+                log("   • Device-ID no registrado en gpodder.net")
+                log("   • User-Agent bloqueado por el servidor")
+                
+                # Intentar re-login si es gpodder
+                if self.backend == "gpodder":
+                    log("🔄 Intentando re-autenticación...")
+                    if self._login():  # Asegúrate que _login() existe y funciona
+                        log("✅ Re-login exitoso, reintentando petición...")
+                        resp = self.session.get(
+                            url,
+                            auth=(self.username, self.password),
+                            headers={"User-Agent": "litepop/1.0 (Terminal Podcast Client)"},
+                            timeout=30
+                        )
+                        if resp.status_code == 200:
+                            log("✅ Petición exitosa tras re-login")
+                        else:
+                            log(f"❌ Re-intento también falló: HTTP {resp.status_code}")
+                    else:
+                        log("❌ Re-login fallido")
+                return []
             
             if not resp.content:
                 log("Empty response from subscriptions endpoint")
                 return []
             
             data = resp.json()
+            log(f"DEBUG gpodder - Tipo de respuesta: {type(data)}, Contenido: {str(data)[:200]}")
+
+            # Distinguir entre lista vacía legítima vs error
+            if isinstance(data, list) and len(data) == 0:
+                # Verificar si es realmente "sin suscripciones" o problema de auth
+                # Hacer una petición de prueba al endpoint de toplist para verificar conexión
+                test_url = urljoin(self.server_url, "toplist/1.json")
+                try:
+                    test_resp = self.session.get(test_url, timeout=10)
+                    if test_resp.status_code == 200:
+                        log("✅ Conexión a gpodder.net funciona, realmente no hay suscripciones")
+                    else:
+                        log(f"⚠️ Posible problema de conexión: toplist devolvió {test_resp.status_code}")
+                except Exception as e:
+                    log(f"⚠️ No se pudo verificar conexión: {str(e)}")
             log(f"Raw subscriptions response: {data}")
 
             # Handle different response formats
@@ -379,7 +519,26 @@ class GPodderSync:
         """Get episode actions from server with improved parsing"""
         try:
             if self.backend == "nextcloud":
-                url = urljoin(self.server_url, "episode_action")
+                # ✅ gpoddersync: sin .json, con parámetro 'since' opcional
+                base = self.server_url.rstrip('/')
+                url = f"{base}/index.php/apps/gpoddersync/episode_action"
+                params = {}
+                if since:
+                    # gpoddersync acepta timestamp Unix o ISO
+                    params["since"] = int(since.timestamp())
+                log(f"Nextcloud-gpoddersync episode_action URL: {url} params: {params}")
+                resp = self.session.get(
+                    url,
+                    auth=(self.username, self.password),  # ← CRÍTICO: auth explícita
+                    headers={"Accept": "application/json"},
+                    params=params,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # gpoddersync devuelve lista directa, no {"actions": [...]}
+                actions = data if isinstance(data, list) else data.get("actions", [])
+                return {"actions": actions, "timestamp": int(datetime.now().timestamp())}
             elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"api/2/episodes/{self.username}.json")
             else:
@@ -624,7 +783,10 @@ class GPodderSync:
 
             # Choose the correct endpoint
             if self.backend == "nextcloud":
-                url = urljoin(self.server_url, "episode_action/create")
+                # ✅ gpoddersync: POST a esta ruta para crear acciones
+                base = self.server_url.rstrip('/')
+                url = f"{base}/index.php/apps/gpoddersync/episode_action"
+                # Nota: gpoddersync usa POST a la misma URL que GET, no /create
             elif self.backend in ("opodsync", "gpodder"):
                 url = urljoin(self.server_url, f"api/2/episodes/{self.username}.json")
             else:
@@ -641,6 +803,7 @@ class GPodderSync:
                     f"total={action.get('total', 'N/A')} - "
                     f"device={action.get('device', 'N/A')} - "
                     f"guid={action.get('guid', 'N/A')[:30]}...")
+                    
         
             # Prepare headers
             headers = {
@@ -648,12 +811,15 @@ class GPodderSync:
                 "Content-Type": "application/json",
                 "Accept": "application/json"
             }
+            
+            payload = formatted_actions if self.backend == "nextcloud" else {"actions": formatted_actions}
         
             # Make the request
             resp = self.session.post(
                 url,
+                auth=(self.username, self.password),  # ← CRÍTICO
                 headers=headers,
-                json=formatted_actions,
+                json=payload,
                 timeout=30,
             )
         
@@ -2262,6 +2428,101 @@ class Litepop:
         else:
             self.selected_index = 0
         self.set_status_message(f"Cleaned up {initial_len - len(self.queue)} completed episodes.")
+        
+    def save_local_queue(self) -> None:
+        """Saves the current queue state to disk (playback progress 0% to <50%)."""
+        try:
+            save_path = Path.home() / ".config" / "litepop" / "local_queue.json"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            queue_data = []
+            for ep in self.queue:
+                # Calculate PLAYBACK progress dynamically, ignoring download progress contamination
+                playback_progress = 0.0
+                if ep.duration and ep.duration > 0 and ep.position >= 0:
+                    playback_progress = (ep.position / ep.duration) * 100
+                playback_progress = min(playback_progress, 100.0)
+
+                is_completed = bool(ep.completed)
+
+                if not is_completed and playback_progress < 95.0:
+                    queue_data.append({
+                        "url": ep.url,
+                        "podcast_url": ep.podcast_url or "",
+                        "title": ep.title,
+                        "position": int(ep.position) if ep.position else 0,
+                        "progress": playback_progress,
+                        "duration": float(ep.duration) if ep.duration else 0.0,
+                        "guid": ep.guid or ""
+                    })
+                else:
+                    log(f"Queue save skip: '{ep.title}' | completed={is_completed} | playback_progress={playback_progress:.1f}%")
+
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(queue_data, f, ensure_ascii=False, indent=2)
+            log(f"Local queue saved: {len(queue_data)} episodes (playback <95%)")
+        except Exception as e:
+            log(f"Error saving local queue: {str(e)}")
+
+    def load_local_queue(self) -> None:
+        """Loads the local queue, restores episodes with <95% playback, and auto-downloads them."""
+        try:
+            load_path = Path.home() / ".config" / "litepop" / "local_queue.json"
+            if not load_path.exists():
+                log("No local queue file found.")
+                return
+
+            with open(load_path, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+
+            current_queue_urls = {ep.url for ep in self.queue}
+            added_count = 0
+
+            for item in local_data:
+                ep_url = item.get("url")
+                if not ep_url or ep_url in current_queue_urls:
+                    continue
+
+                # Check REAL status updated by server (in case it was played on another device)
+                server_status = self._get_episode_server_status(ep_url)
+                server_progress = float(server_status.get("progress", item.get("progress", 0.0)))
+
+                # FILTER: Only restore if server playback progress is still <50%
+                if server_progress < 95.0:
+                    found_episode = None
+                    for feed in self.subscriptions:
+                        for ep_data in feed.episodes:
+                            if ep_data.get("url") == ep_url:
+                                found_episode = ep_data
+                                break
+                        if found_episode:
+                            break
+
+                    if found_episode:
+                        ep = Episode(found_episode)
+                        ep.position = int(item.get("position", 0))
+                        ep.progress = server_progress
+                        ep.server_completed = server_progress >= 98.0
+                        self.queue.append(ep)
+                        current_queue_urls.add(ep_url)
+                        added_count += 1
+
+                        # Auto-download upon restore (uses existing callback)
+                        self.download_manager.download_episode(ep, callback=self._on_download_complete)
+                        log(f"Restored and queued for download: {ep.title} (server playback: {server_progress:.1f}%)")
+                    else:
+                        log(f"Episode not found in current feeds: {ep_url}")
+                else:
+                    log(f"Skipped on load (already >95% on server): {item.get('title', ep_url)}")
+
+            if added_count > 0:
+                log(f"Successfully restored {added_count} episodes from local queue.")
+                self.needs_refresh.set()
+            else:
+                log("Local queue loaded, but all episodes were already played or present in the queue.")
+
+        except Exception as e:
+            log(f"Error loading local queue: {str(e)}")
 
     def _sync_episode_position(self, episode: Episode) -> None:
         """Syncs episode position to gPodder"""
@@ -2292,6 +2553,9 @@ class Litepop:
             self.stdscr.addstr(5, 2, "Performing initial sync, please wait...")
             self.stdscr.refresh()
             time.sleep(0.5)
+        
+        # ⬇️ NUEVO: Cargar cola local tras terminar la sync inicial
+        self.load_local_queue()
         
         # selected_index = 0
         try:
@@ -2456,6 +2720,9 @@ class Litepop:
             # Cleanup
             log("Shutting down application")
             self.player.stop()
+            
+            # ⬇️ NUEVO: Guardar cola local antes de cerrar
+            self.save_local_queue()
             
             # Upload any pending actions before exit
             pending = self._get_pending_actions()
