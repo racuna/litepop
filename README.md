@@ -59,6 +59,31 @@ Make sure the config file is generated at `~/.config/litepop.conf` upon first ru
 Edit `~/.config/litepop.conf` to adjust player command, download folder, and gPodder credentials:
 
 ```ini
+[filepodsync]
+# Set FilePodSync as the primary sync method
+enabled = true
+
+# Shared folder path (Syncthing, Dropbox, etc.)
+# Use absolute paths. In WSL: /mnt/c/Users/...
+sync_dir = /mnt/c/Users/racuna/ownstuff/Filen/filepodsync/
+
+# Device name used to identify this client
+device_name = litepop_wsl_laptop
+
+# Platform: linux, windows, macos, wsl
+platform = wsl
+
+# Minimum interval between syncs in seconds (FilePodSync has an internal 5-second throttle)
+min_sync_interval = 30
+
+# Fallback to gPodder/opodsync for compatibility with apps like AntennaPod
+# If true, LitePop will also send progress data to the gPodder server
+enable_gpodder_fallback = true
+
+# Sync the queue only with FilePodSync (gPodder does not support this)
+# If false, the queue is local only
+sync_queue_with_filepodsync = true
+
 [gpodder]
 server_url = https://sync-server.com
 username = yourusername
