@@ -15,6 +15,7 @@ Built with `curses` for a clean terminal UI and using `mpv` for audio playback, 
 - Episode queue with per-item progress display
 - Auto-recovery of partially played episodes
 - Grouped view by publication date when adding episodes
+- FilePodsync compatible https://github.com/racuna/FilePodSyc
 
 ## Requirements
 
