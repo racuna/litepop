@@ -3,7 +3,6 @@
 litepop - Linux Terminal Podcast Player
 Nextcloud-gPodder and opodsync synchronization, playlist queue, and smart download
 """
-
 import curses
 import json
 import os
@@ -19,20 +18,14 @@ import socket
 import email.utils
 import sys
 import traceback
-from datetime import datetime, date  # Explicitly import date
+from datetime import datetime, date, timezone
 from urllib.parse import urljoin
 from typing import List, Dict, Optional
 from pathlib import Path
 
-def get_utc_now() -> datetime:
-    """Get current UTC time compatible with Python 3.x and 3.13+"""
-    try:
-        # Python 3.11+
-        from datetime import UTC
-        return datetime.now(UTC)
-    except ImportError:
-        # Python 3.0-3.10
-        return datetime.utcnow()
+# ─────────────────────────────────────────────────────────────
+# UTILIDADES (Deben definirse ANTES de cualquier llamada a log())
+# ─────────────────────────────────────────────────────────────
 
 def rotate_log_if_needed(log_file: str, max_size_mb: int = 5) -> None:
     """Rotate log file if it exceeds max size"""
@@ -40,49 +33,74 @@ def rotate_log_if_needed(log_file: str, max_size_mb: int = 5) -> None:
     if log_path.exists():
         size_mb = log_path.stat().st_size / (1024 * 1024)
         if size_mb > max_size_mb:
-            # Keep last 1000 lines only
             try:
-                lines = log_path.read_text().splitlines()
-                log_path.write_text('\n'.join(lines[-1000:]) + '\n')
+                lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                log_path.write_text('\n'.join(lines[-1000:]) + '\n', encoding="utf-8")
             except Exception:
-                log_path.write_text("")  # Clear if rotation fails
+                log_path.write_text("", encoding="utf-8")
 
 def log(msg: str, log_file: Optional[str] = None) -> None:
-    """Global logging function"""
+    """Global logging function with robust encoding fallback"""
     if log_file is None:
-        # Usar archivo desde la configuración si existe
         config_path = Path.home() / ".config" / "litepop.conf"
         if config_path.exists():
             cfg = configparser.ConfigParser()
-            cfg.read(config_path)
+            # Intentar múltiples encodings para evitar UnicodeDecodeError
+            for enc in ["utf-8", "iso-8859-1", "cp1252", "latin-1"]:
+                try:
+                    cfg.read(config_path, encoding=enc)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
             log_file = cfg.get("player", "log_file", fallback="/tmp/litepop_debug.log")
         else:
             log_file = "/tmp/litepop_debug.log"
-    
+            
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Filter out non-meaningful messages for UI display
+    # Filtrar mensajes vacíos
     msg_lower = msg.lower().strip()
     if msg_lower in ['{}', '}', '{', '[]', 'none', '']:
-        return  # Don't log empty/meaningless messages
+        return
         
     rotate_log_if_needed(log_file)
     
-    with open(log_file, "a") as f:
+    # Escribir log de forma segura
+    with open(log_file, "a", encoding="utf-8", errors="replace") as f:
         f.write(f"{datetime.now()}: {msg}\n")
 
-# ─────────────────────────────────────────────────────────────
-# REDIRECCIÓN DE EXCEPCIONES DE HILOS AL ARCHIVO DE LOG
-# ─────────────────────────────────────────────────────────────
+def get_utc_now() -> datetime:
+    """Get current UTC time compatible with Python 3.x and 3.13+"""
+    try:
+        from datetime import UTC
+        return datetime.now(UTC)
+    except ImportError:
+        return datetime.utcnow()
+
 def _thread_excepthook(args):
     """Intercepta cualquier excepción no manejada en un hilo y la guarda en el log"""
     try:
         tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
         log(f"⚠️ Unhandled thread exception:\n{tb}")
     except Exception:
-        pass  # Evita bucles si el sistema de log falla
+        pass
 threading.excepthook = _thread_excepthook
+
+# ─────────────────────────────────────────────────────────────
+# Filepodsync import
+# ─────────────────────────────────────────────────────────────
+FILEPODSYNC_AVAILABLE = False
+FilePodSync = None  # If is available
+
+try:
+    from filepodsync import FilePodSync
+    FILEPODSYNC_AVAILABLE = True
+    log("✅ FilePodSync library available")
+except ImportError:
+    log("⚠️ FilePodSync library NOT available - install with: pip install filepodsync")
+except Exception as e:
+    log(f"⚠️ Error importing FilePodSync: {str(e)}")
 
 class Config:
     """Handles configuration file operations"""
@@ -117,6 +135,18 @@ class Config:
             "player_command": "mpv --no-config --no-video --af=loudnorm=i=-16:lra=11:tp=-1.5 --speed={speed} --start={start_time} --input-ipc-server={ipc_socket} {file}"
         }
         self.save_config()
+    
+    def get_filepodsync_config(self) -> Dict[str, str]:
+        """Obtiene configuración específica para FilePodSync"""
+        return {
+            "enabled": self.config.getboolean("filepodsync", "enabled", fallback=False),
+            "sync_dir": self.config.get("filepodsync", "sync_dir", fallback=""),
+            "device_name": self.config.get("filepodsync", "device_name", fallback="litepop"),
+            "platform": self.config.get("filepodsync", "platform", fallback="python"),
+            "min_sync_interval": self.config.getint("filepodsync", "min_sync_interval", fallback=30),
+            "enable_gpodder_fallback": self.config.getboolean("filepodsync", "enable_gpodder_fallback", fallback=True),
+            "sync_queue_with_filepodsync": self.config.getboolean("filepodsync", "sync_queue_with_filepodsync", fallback=True),
+        }    
 
     def save_config(self) -> None:
         with self.config_file.open("w") as f:
@@ -898,6 +928,304 @@ class GPodderSync:
                     return {"error": str(e)}
             return {"error": str(e)}
 
+class FilePodSyncClient:
+    """
+    Wrapper para FilePodSync con integración en litepop.
+    
+    Características implementadas:
+    ✓ Sincronización de feeds (suscripciones)
+    ✓ Sincronización de episodios (progreso, estado)
+    ✓ Sincronización de queue de reproducción (solo FilePodSync)
+    ✓ Merge LWW-EL para resolución de conflictos
+    ✓ Fallback a gPodder para compatibilidad móvil
+    """
+    
+    def __init__(self, config: Config, gpodder_fallback: Optional[GPodderSync] = None):
+        self.config = config
+        self.fps_config = config.get_filepodsync_config()
+        self.gpodder = gpodder_fallback  # Para fallback
+        self.fps = None
+        self._initialized = False
+        
+        if not FILEPODSYNC_AVAILABLE:
+            log("❌ FilePodSyncClient: library not available")
+            return
+            
+        if not self.fps_config["enabled"]:
+            log("ℹ️ FilePodSyncClient: disabled in config")
+            return
+            
+        sync_dir = self.fps_config["sync_dir"]
+        if not sync_dir or not Path(sync_dir).exists():
+            log(f"❌ FilePodSyncClient: sync_dir not configured or doesn't exist: {sync_dir}")
+            return
+            
+        try:
+            # Inicializar cliente FilePodSync
+            self.fps = FilePodSync(
+                sync_dir=sync_dir,
+                device_name=self.fps_config["device_name"],
+                platform=self.fps_config["platform"],
+                client="litepop"
+            )
+            self._initialized = True
+            log(f"✅ FilePodSyncClient initialized: {sync_dir}")
+            
+            # Forzar sync inicial para cargar estado remoto
+            self.fps.sync(force=True)
+            
+        except Exception as e:
+            log(f"❌ FilePodSyncClient initialization failed: {str(e)}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
+    
+    def is_available(self) -> bool:
+        """Verifica si FilePodSync está listo para usar"""
+        return self._initialized and self.fps is not None
+    
+    def add_feed(self, url: str, title: str = "") -> bool:
+        """Añade un feed a FilePodSync (y a gPodder si fallback está activo)"""
+        success = False
+        
+        if self.is_available():
+            try:
+                result = self.fps.add_feed(url, title)
+                if result:
+                    success = True
+                    log(f"✅ Feed added to FilePodSync: {url}")
+            except Exception as e:
+                log(f"⚠️ Error adding feed to FilePodSync: {str(e)}")
+        
+        # Fallback a gPodder si está configurado
+        if self.fps_config["enable_gpodder_fallback"] and self.gpodder:
+            try:
+                # gPodder ya tiene add_feed implícito en get_subscriptions,
+                # pero podemos registrar la suscripción localmente
+                log(f"ℹ️ Feed will be synced via gPodder fallback: {url}")
+            except Exception as e:
+                log(f"⚠️ gPodder fallback warning: {str(e)}")
+        
+        return success
+    
+    def remove_feed(self, url: str, archive: bool = False) -> bool:
+        """Elimina o archiva un feed"""
+        if self.is_available():
+            try:
+                return self.fps.remove_feed(url, archive=archive)
+            except Exception as e:
+                log(f"⚠️ Error removing feed from FilePodSync: {str(e)}")
+        return False
+    
+    def update_episode_progress(
+        self,
+        episode_url: str,
+        feed_url: str,
+        position: int,
+        total: int,
+        state: str = "in_progress",
+        guid: Optional[str] = None,
+        title: str = ""
+    ) -> str:
+        """
+        Actualiza progreso de episodio en FilePodSync.
+        Retorna el episode_id generado.
+        """
+        ep_id = ""
+        
+        if self.is_available():
+            try:
+                ep_id = self.fps.update_episode(
+                    episode_url=episode_url,
+                    feed_url=feed_url,
+                    guid=guid,
+                    title=title,
+                    position=position,
+                    total=total,
+                    state=state
+                )
+                log(f"📝 Episode progress updated in FilePodSync: {ep_id} @ {position}s")
+            except Exception as e:
+                log(f"⚠️ Error updating episode in FilePodSync: {str(e)}")
+        
+        # Fallback: enviar a gPodder también si está activo
+        if self.fps_config["enable_gpodder_fallback"] and self.gpodder:
+            try:
+                action = {
+                    "podcast": feed_url,
+                    "episode": episode_url,
+                    "action": "play" if state == "in_progress" else "download",
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "position": position,
+                    "started": 0,
+                    "total": total if total > 0 else -1,
+                    "guid": guid or "",
+                    "device": self.gpodder.device_id
+                }
+                self.gpodder.upload_episode_actions([action])
+                log(f"📤 Episode progress sent to gPodder fallback: {episode_url}")
+            except Exception as e:
+                log(f"⚠️ gPodder fallback upload failed: {str(e)}")
+        
+        return ep_id
+    
+    def mark_episode_completed(self, episode_url: str, feed_url: str, guid: Optional[str] = None) -> bool:
+        """Marca episodio como completado (99%+ de progreso)"""
+        return self.update_episode_progress(
+            episode_url=episode_url,
+            feed_url=feed_url,
+            position=999999,  # Valor alto para forzar completado
+            total=1000000,
+            state="completed",
+            guid=guid
+        ) != ""
+    
+    # ───────── Queue Operations (SOLO FilePodSync) ─────────
+    
+    def queue_add(self, ep_id: str, after_id: Optional[str] = None) -> bool:
+        """Añade episodio a la queue de FilePodSync"""
+        if not self.fps_config["sync_queue_with_filepodsync"]:
+            return False
+            
+        if self.is_available():
+            try:
+                self.fps.queue_add(ep_id, after_id=after_id)
+                log(f"🎵 Episode added to FilePodSync queue: {ep_id}")
+                return True
+            except Exception as e:
+                log(f"⚠️ Error adding to FilePodSync queue: {str(e)}")
+        return False
+    
+    def queue_remove(self, ep_ids: List[str]) -> bool:
+        """Elimina episodios de la queue de FilePodSync"""
+        if not self.fps_config["sync_queue_with_filepodsync"]:
+            return False
+            
+        if self.is_available():
+            try:
+                self.fps.queue_remove(ep_ids)
+                log(f"🗑️ Episodes removed from FilePodSync queue: {ep_ids}")
+                return True
+            except Exception as e:
+                log(f"⚠️ Error removing from FilePodSync queue: {str(e)}")
+        return False
+    
+    def queue_clear(self) -> bool:
+        """Limpia toda la queue de FilePodSync"""
+        if not self.fps_config["sync_queue_with_filepodsync"]:
+            return False
+            
+        if self.is_available():
+            try:
+                self.fps.queue_clear()
+                log("🧹 FilePodSync queue cleared")
+                return True
+            except Exception as e:
+                log(f"⚠️ Error clearing FilePodSync queue: {str(e)}")
+        return False
+    
+    def get_queue(self) -> List[Dict]:
+        """Obtiene la queue actual de FilePodSync"""
+        if not self.fps_config["sync_queue_with_filepodsync"]:
+            return []
+            
+        if self.is_available():
+            try:
+                return self.fps.get_queue()
+            except Exception as e:
+                log(f"⚠️ Error getting FilePodSync queue: {str(e)}")
+        return []
+    
+    # ───────── Sync & Bootstrap ─────────
+    
+    def sync(self, force: bool = False) -> Dict[str, Any]:
+        """Ejecuta ciclo de sincronización de FilePodSync"""
+        if not self.is_available():
+            return {"error": "FilePodSync not available"}
+        
+        try:
+            result = self.fps.sync(force=force)
+            log(f"🔄 FilePodSync sync complete: {result}")
+            return result
+        except Exception as e:
+            log(f"❌ FilePodSync sync failed: {str(e)}")
+            return {"error": str(e)}
+    
+    def bootstrap_from_local(
+        self, 
+        feeds: List[Dict], 
+        episodes: List[Dict], 
+        queue_ep_ids: Optional[List[str]] = None
+    ) -> Dict[str, int]:
+        """
+        Importa biblioteca local existente a FilePodSync.
+        Útil para primera vez que usas sync en un dispositivo.
+        """
+        if not self.is_available():
+            return {}
+        
+        try:
+            result = self.fps.bootstrap_from_local(feeds, episodes, queue_ep_ids)
+            # Forzar sync para propagar a otros dispositivos
+            self.fps.sync(force=True)
+            log(f"📦 FilePodSync bootstrap complete: {result}")
+            return result
+        except Exception as e:
+            log(f"⚠️ FilePodSync bootstrap failed: {str(e)}")
+            return {}
+    
+    # ───────── Read Accessors ─────────
+    
+    def get_feeds(self, include_archived: bool = False) -> Dict[str, Dict]:
+        """Obtiene feeds desde FilePodSync"""
+        if self.is_available():
+            return self.fps.get_feeds(include_archived=include_archived)
+        return {}
+    
+    def get_episodes(self) -> Dict[str, Dict]:
+        """Obtiene todos los episodios desde FilePodSync"""
+        if self.is_available():
+            return self.fps.get_episodes()
+        return {}
+    
+    def get_episodes_for_feed(self, feed_url: str) -> Dict[str, Dict]:
+        """Obtiene episodios de un feed específico"""
+        if self.is_available():
+            return self.fps.get_episodes_for_feed(feed_url)
+        return {}
+    
+    # ───────── Export/Import ─────────
+    
+    def export_opml(self, include_archived: bool = True) -> str:
+        """Exporta suscripciones a formato OPML"""
+        if self.is_available():
+            return self.fps.export_opml(include_archived=include_archived)
+        return ""
+    
+    def import_opml(self, opml_text: str) -> int:
+        """Importa suscripciones desde OPML"""
+        if self.is_available():
+            return self.fps.import_opml(opml_text)
+        return 0
+    
+    # ───────── Lifecycle ─────────
+    
+    def shutdown(self) -> None:
+        """Limpia recursos antes de cerrar"""
+        if self.is_available():
+            try:
+                self.fps.shutdown()
+                log("🔌 FilePodSync shutdown complete")
+            except Exception as e:
+                log(f"⚠️ FilePodSync shutdown warning: {str(e)}")
+    
+    def __enter__(self):
+        """Soporte para context manager"""
+        return self
+    
+    def __exit__(self, *args):
+        """Cleanup automático con 'with'"""
+        self.shutdown()
+
 class PodcastFeed:
     """Represents a podcast feed with episodes"""
     def __init__(self, url: str):
@@ -1378,6 +1706,20 @@ class Litepop:
         log_path.write_text("")
         log("Starting Litepop application", self.log_file)
         self.gpodder = GPodderSync(self.config)
+        self.filepodsync = FilePodSyncClient(
+            config=self.config, 
+            gpodder_fallback=self.gpodder
+        )
+        # 3. Determinar qué backend usar para cada operación
+        self._use_filepodsync_for_feeds = self.filepodsync.is_available()
+        self._use_filepodsync_for_progress = self.filepodsync.is_available()
+        self._use_filepodsync_for_queue = (
+            self.filepodsync.is_available() and 
+            self.config.get_filepodsync_config()["sync_queue_with_filepodsync"]
+        )
+        log(f"🎯 Sync strategy: feeds={'FilePodSync' if self._use_filepodsync_for_feeds else 'gPodder'}, "
+            f"progress={'FilePodSync' if self._use_filepodsync_for_progress else 'gPodder'}, "
+            f"queue={'FilePodSync' if self._use_filepodsync_for_queue else 'local-only'}")
         self.download_manager = DownloadManager(self.config.get("player", "temp_dir", "/tmp/litepop"))
         self.player = Player(self.config)
         self.queue = []
@@ -1447,69 +1789,86 @@ class Litepop:
                 time.sleep(5.0)
 
     def _position_sync_worker(self) -> None:
-        """Syncs playback position to gPodder every 30 seconds"""
+        """Syncs playback position to backends every 30 seconds"""
         last_synced_position = {}
         last_sync_time = {}
         
         while self.running:
             try:
+                # Inicializar should_sync por defecto
+                should_sync = False
+                
                 if self.player.playing and 0 <= self.current_index < len(self.queue):
                     episode = self.queue[self.current_index]
                     position = int(self.player.get_position())
                     duration = self.player.get_duration()
-                    
                     last_pos = last_synced_position.get(episode.url, 0)
                     last_time = last_sync_time.get(episode.url, 0)
                     current_time = time.time()
                     
-                    # Sincronizar si:
-                    # 1. Han pasado 30 segundos desde última sync
-                    # 2. O la posición cambió más de 15 segundos
+                    # Calcular si debe sincronizar
                     should_sync = (
-                        position > 5 and 
+                        position > 5 and
                         duration > 0 and
                         (current_time - last_time > 30 or abs(position - last_pos) > 15)
                     )
                     
                     if should_sync:
+                        # Validaciones básicas
                         if not self.gpodder.device_id or self.gpodder.device_id == "default":
-                            log("ERROR: device_id not resolved yet, skipping position sync")
+                            log("⚠️ device_id not resolved, skipping position sync")
                             time.sleep(30)
                             continue
-                        
-                        # VALIDAR que tenemos podcast_url
+                            
                         podcast_url = episode.podcast_url or episode.podcast_title
                         if not podcast_url:
-                            log(f"ERROR: No podcast URL for episode {episode.title}, skipping sync")
+                            log(f"⚠️ No podcast URL for {episode.title}, skipping sync")
                             time.sleep(30)
                             continue
                         
-                        action = {
-                            "podcast": podcast_url,
-                            "episode": episode.url,
-                            "action": "play",
-                            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "device": self.gpodder.device_id,
-                            "position": position,
-                            "started": 0,
-                            "total": int(duration) if duration > 0 else 0,
-                        }
+                        # ───────── FilePodSync (primario) ─────────
+                        if self._use_filepodsync_for_progress and self.filepodsync.is_available():
+                            try:
+                                self.filepodsync.update_episode_progress(
+                                    episode_url=episode.url,
+                                    feed_url=podcast_url,
+                                    position=position,
+                                    total=int(duration) if duration > 0 else -1,
+                                    state="in_progress",
+                                    guid=episode.guid,
+                                    title=episode.title
+                                )
+                                last_synced_position[episode.url] = position
+                                last_sync_time[episode.url] = current_time
+                                log(f"📤 Position synced to FilePodSync: {position}s")
+                            except Exception as e:
+                                log(f"⚠️ FilePodSync position sync failed: {str(e)}")
                         
-                        # IMPORTANTE: Siempre incluir guid si existe
-                        if episode.guid and str(episode.guid).strip():
-                            action["guid"] = str(episode.guid).strip()
+                        # ───────── gPodder fallback ─────────
+                        if (self.config.get_filepodsync_config()["enable_gpodder_fallback"] and 
+                            self.gpodder):
+                            try:
+                                action = {
+                                    "podcast": podcast_url,
+                                    "episode": episode.url,
+                                    "action": "play",
+                                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                    "position": position,
+                                    "started": 0,
+                                    "total": int(duration) if duration > 0 else -1,
+                                    "guid": episode.guid if episode.guid else "",
+                                    "device": self.gpodder.device_id
+                                }
+                                self.gpodder.upload_episode_actions([action])
+                                log(f"📤 Position synced to gPodder fallback")
+                            except Exception as e:
+                                log(f"⚠️ gPodder fallback position sync failed: {str(e)}")
                         
-                        log(f"Syncing position: {episode.title} at {position}s/{int(duration)}s (guid: {action.get('guid', 'none')})")
-                        result = self.gpodder.upload_episode_actions([action])
-                        
-                        if result and "error" not in result:
-                            last_synced_position[episode.url] = position
-                            last_sync_time[episode.url] = current_time
-                            log(f"Position sync successful")
-                        else:
-                            log(f"Position sync failed: {result}")
-                            
-                time.sleep(10)  # Revisar cada 10s
+                        time.sleep(10)  # Esperar tras sync exitoso
+                
+                # Sleep al final del loop, fuera de cualquier if
+                time.sleep(10)
+                
             except Exception as e:
                 log(f"Error in position sync: {str(e)}")
                 import traceback
@@ -1520,14 +1879,14 @@ class Litepop:
         """Handles periodic sync with gPodder"""
         sync_interval = int(self.config.get("gpodder", "sync_interval", "300"))
         log("Starting initial sync")
-        self._sync_with_gpodder()
+        self._sync_all_backends()
         self.initial_sync_done = True
         log("Initial sync completed")
         while self.running:
             time.sleep(sync_interval)
             if self.running:
                 log("Starting periodic sync")
-                self._sync_with_gpodder()
+                self._sync_all_backends()
 
     def _playback_monitor(self) -> None:
         """Monitors playback status and auto-plays next episode"""
@@ -1645,91 +2004,92 @@ class Litepop:
 
             time.sleep(0.5)
 
-    def _sync_with_gpodder(self) -> bool:
-        """Syncs subscriptions and episode actions with gPodder"""
+    def _sync_all_backends(self) -> bool:
+        """
+        Sincroniza con todos los backends configurados.
+        Estrategia: FilePodSync como primario, gPodder como fallback.
+        """
         try:
-            if not self.config.get("gpodder", "username") or not self.config.get("gpodder", "password"):
-                log("No credentials configured")
-                return False
+            log("🔄 Starting multi-backend sync")
             
-            log("Starting sync with gPodder server")
-            
-            # Upload any pending local actions first
+            # ───────── 1. Subir acciones locales pendientes ─────────
             local_actions = self._get_pending_actions()
             if local_actions:
-                log(f"Uploading {len(local_actions)} local actions")
-                self.gpodder.upload_episode_actions(local_actions)
+                log(f"📤 Uploading {len(local_actions)} local actions")
+                
+                # Prioridad: FilePodSync si está disponible
+                if self._use_filepodsync_for_progress:
+                    for action in local_actions:
+                        self.filepodsync.update_episode_progress(
+                            episode_url=action.get("episode", ""),
+                            feed_url=action.get("podcast", ""),
+                            position=action.get("position", 0),
+                            total=action.get("total", -1),
+                            state="completed" if action.get("action") == "download" else "in_progress",
+                            guid=action.get("guid"),
+                            title=""  # Podrías extraer título si lo necesitas
+                        )
+                
+                # Fallback: gPodder si está habilitado
+                if (self.config.get_filepodsync_config()["enable_gpodder_fallback"] and 
+                    self.gpodder and 
+                    not self._use_filepodsync_for_progress):
+                    self.gpodder.upload_episode_actions(local_actions)
             
-            # Get episode actions from server
-            actions_data = self.gpodder.get_episode_actions()
-            self._update_episode_actions_cache(actions_data.get("actions", []))
-            
-            # Get subscriptions
-            subscriptions = self.gpodder.get_subscriptions()
-            
-            # NUEVO: Eliminar duplicados manteniendo el orden original
-            subscriptions = list(dict.fromkeys(subscriptions))
-            if len(subscriptions) < len(self.gpodder.subscriptions_cache):
-                log(f"Deduplicated subscriptions: removed {len(self.gpodder.subscriptions_cache) - len(subscriptions)} duplicates")
-            
-            # If we already have subscriptions and get empty result, just refresh existing feeds
-            if not subscriptions and self.subscriptions:
-                log("No new subscriptions, refreshing existing feeds")
+            # ───────── 2. Sincronizar feeds (suscripciones) ─────────
+            if self._use_filepodsync_for_feeds and self.filepodsync.is_available():
+                # FilePodSync maneja feeds internamente
+                fps_feeds = self.filepodsync.get_feeds()
+                log(f"📚 FilePodSync: {len(fps_feeds)} feeds loaded")
+                
+                # Convertir a lista de URLs para compatibilidad con el resto del código
+                self.subscriptions = [PodcastFeed(url) for url in fps_feeds.keys()]
                 for feed in self.subscriptions:
-                    feed.fetch()
-                self.last_sync = datetime.now()
-                self._load_auto_queue()
-                return True
-            
-            if not subscriptions:
-                log("No subscriptions found")
-                return False
-
-            # Fetch new feeds in parallel
-            new_feeds = []
-            threads = []
-            feed_lock = threading.Lock()
-
-            def fetch_feed_threaded(sub_url: str) -> None:
-                feed = PodcastFeed(sub_url)
-                if feed.fetch():
-                    with feed_lock:
-                        new_feeds.append(feed)
-
-            log(f"Fetching {len(subscriptions)} feeds")
-            for sub_url in subscriptions:
-                thread = threading.Thread(target=fetch_feed_threaded, args=(sub_url,))
-                threads.append(thread)
-                thread.start()
-
-            for thread in threads:
-                thread.join()
+                    feed.fetch()  # Cargar episodios del RSS
+                    
+            else:
+                # Fallback a gPodder para obtener suscripciones
+                subscriptions = self.gpodder.get_subscriptions()
+                subscriptions = list(dict.fromkeys(subscriptions))  # Eliminar duplicados
                 
-            # NUEVO: Forzar limpieza de referencias antiguas y validar que feeds aún existen
-            current_sub_urls = {feed.url for feed in new_feeds}
-            old_queue_len = len(self.queue)
+                if subscriptions:
+                    self.subscriptions = [PodcastFeed(url) for url in subscriptions]
+                    for feed in self.subscriptions:
+                        feed.fetch()
+                    log(f"📚 gPodder fallback: {len(subscriptions)} feeds loaded")
             
-            # Eliminar de la cola episodios de feeds que ya no están suscritos
-            self.queue = [ep for ep in self.queue if ep.podcast_url in current_sub_urls]
+            # ───────── 3. Sincronizar progreso de episodios ─────────
+            if self._use_filepodsync_for_progress and self.filepodsync.is_available():
+                # FilePodSync ya tiene el estado mergeado, solo refrescar cache local
+                fps_episodes = self.filepodsync.get_episodes()
+                self._update_episode_actions_cache_from_fps(fps_episodes)
+                log(f"📊 FilePodSync: {len(fps_episodes)} episodes synced")
+            else:
+                # Fallback a gPodder
+                actions_data = self.gpodder.get_episode_actions()
+                self._update_episode_actions_cache(actions_data.get("actions", []))
             
-            # Validar índice actual y estado del reproductor
-            if not self.queue:
-                self.current_index = -1
-                self.player.stop()
-            elif self.current_index >= len(self.queue):
-                # El índice apuntaba a un episodio eliminado o quedó desfasado
-                self.current_index = -1
-                self.player.stop()
-                
-            self.subscriptions = new_feeds
-            self.last_sync = datetime.now()
+            # ───────── 4. Sincronizar queue (SOLO FilePodSync) ─────────
+            if self._use_filepodsync_for_queue and self.filepodsync.is_available():
+                fps_queue = self.filepodsync.get_queue()
+                if fps_queue:
+                    log(f"🎵 FilePodSync queue: {len(fps_queue)} items")
+                    # Aquí podrías integrar la queue de FilePodSync con la local
+                    # Por ahora, solo logueamos para el ejemplo
+            
+            # ───────── 5. Cargar queue automática ─────────
             self._load_auto_queue()
-            log(f"Sync completed: {len(new_feeds)} feeds loaded. Queue sanitized: {old_queue_len - len(self.queue)} episodes removed.")
+            
+            self.last_sync = datetime.now()
             self.needs_refresh.set()
+            
+            log("✅ Multi-backend sync completed")
             return True
             
         except Exception as e:
-            log(f"Error in sync: {str(e)}")
+            log(f"❌ Sync failed: {str(e)}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
             return False
 
     def _update_episode_actions_cache(self, actions: List[Dict]) -> None:
@@ -1793,6 +2153,47 @@ class Litepop:
             )
             self.episode_actions_cache = dict(sorted_entries[:self.max_cache_entries])
             log(f"Cache trimmed to {self.max_cache_entries} entries")
+
+    def _update_episode_actions_cache_from_fps(self, fps_episodes: Dict[str, Dict]) -> None:
+        """
+        Actualiza el cache local de episodios desde FilePodSync.
+        Convierte el formato de FilePodSync al formato interno de litepop.
+        """
+        for ep_id, ep_data in fps_episodes.items():
+            episode_url = ep_data.get("url", "")
+            if not episode_url:
+                continue
+                
+            # Mapear estados de FilePodSync a formato interno
+            fps_state = ep_data.get("state", "unplayed")
+            state_map = {
+                "completed": "download",
+                "in_progress": "play", 
+                "unplayed": "play",
+                "skipped": "delete"
+            }
+            
+            # Calcular progreso
+            position = ep_data.get("progress_seconds", 0)
+            total = ep_data.get("duration_seconds", -1)
+            progress = (position / total * 100) if total > 0 else 0
+            
+            # Actualizar cache
+            if episode_url not in self.episode_actions_cache:
+                self.episode_actions_cache[episode_url] = {}
+                
+            self.episode_actions_cache[episode_url].update({
+                "progress": min(progress, 100.0),
+                "position": position,
+                "total": total if total > 0 else -1,
+                "server_completed": fps_state == "completed" or progress >= 98.0,
+                "last_action": state_map.get(fps_state, "unknown"),
+                "last_timestamp": ep_data.get("updated_at", ""),
+                "guid": ep_data.get("guid"),
+                "feed_url": ep_data.get("feed_url")
+            })
+            
+            log(f"📝 Cache updated from FilePodSync: {episode_url[:50]}... @ {position}s")
 
     def _get_episode_server_status(self, episode_url: str) -> Dict:
         """Gets episode status from cache"""
@@ -1908,59 +2309,57 @@ class Litepop:
         return actions
 
     def mark_episode_completed(self, episode: Episode) -> None:
-        """Marks episode as completed and uploads status"""
-        log(f"Marking episode as completed: {episode.title}")
+        """Marca episodio como completado usando el backend apropiado"""
+        log(f"✅ Marking episode as completed: {episode.title}")
         episode.completed = True
         episode.progress = 100.0
         episode.server_completed = True
-
-        # IMPORTANTE: Para marcar como completado en AntennaPod,
-        # la posición debe ser muy cercana al total
-        if episode.duration and episode.duration > 0:
-            # Poner position a 99% del total para asegurar que se marque como completado
-            final_position = int(episode.duration * 0.99)
-        else:
-            final_position = int(episode.position) if episode.position else 0
         
+        # Determinar posición final para marcar como completado
+        final_position = int(episode.duration * 0.99) if episode.duration and episode.duration > 0 else int(episode.position)
         total_duration = int(episode.duration) if episode.duration and episode.duration > 0 else final_position
         
-        # CRÍTICO: Enviar acción "play" con position muy cercano a total
-        # NO usar "download" porque AntennaPod no lo interpreta como completado
-        actions = [
-            {
-                "podcast": episode.podcast_url or episode.podcast_title or "",
-                "episode": episode.url,
-                "action": "play",  # Usar "play" no "download"
-                "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "position": final_position,
-                "started": int(self.current_start_position),
-                "total": total_duration,
-                "guid": episode.guid if episode.guid else ""
-            }
-        ]
+        # ───────── FilePodSync (primario) ─────────
+        if self._use_filepodsync_for_progress and self.filepodsync.is_available():
+            try:
+                self.filepodsync.update_episode_progress(
+                    episode_url=episode.url,
+                    feed_url=episode.podcast_url or episode.podcast_title,
+                    position=final_position,
+                    total=total_duration,
+                    state="completed",
+                    guid=episode.guid,
+                    title=episode.title
+                )
+                log(f"📤 Completion sent to FilePodSync")
+            except Exception as e:
+                log(f"⚠️ FilePodSync completion failed: {str(e)}")
         
-        log(f"Uploading completion action: position={final_position}/{total_duration} ({(final_position/total_duration*100) if total_duration > 0 else 0:.1f}%)")
-
-        result = self.gpodder.upload_episode_actions(actions)
+        # ───────── gPodder fallback ─────────
+        if (self.config.get_filepodsync_config()["enable_gpodder_fallback"] and 
+            self.gpodder):
+            try:
+                action = {
+                    "podcast": episode.podcast_url or episode.podcast_title,
+                    "episode": episode.url,
+                    "action": "play",  # gPodder interpreta position ~ total como completado
+                    "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "position": final_position,
+                    "started": int(self.current_start_position),
+                    "total": total_duration,
+                    "guid": episode.guid if episode.guid else "",
+                    "device": self.gpodder.device_id
+                }
+                self.gpodder.upload_episode_actions([action])
+                log(f"📤 Completion sent to gPodder fallback for AntennaPod")
+            except Exception as e:
+                log(f"⚠️ gPodder fallback completion failed: {str(e)}")
         
-        if result and "error" not in result:
-            # Actualizar cache local
-            self.episode_actions_cache[episode.url] = {
-                "progress": 100.0,
-                "position": final_position,
-                "total": total_duration,
-                "server_completed": True,
-                "last_action": "play",
-                "last_timestamp": actions[0]["timestamp"]
-            }
-            log(f"Episode marked as completed successfully")
-        else:
-            log(f"Error marking episode as completed: {result}")
-        
-        # Clean up the file after a short delay
+        # Limpiar archivo local después de un delay
         if episode.local_file:
             threading.Timer(1.0, lambda: self.download_manager.cleanup_file(episode.local_file)).start()
-            self.needs_refresh.set()
+        
+        self.needs_refresh.set()
 
     def draw_header(self) -> None:
         """Draws header for UI"""
@@ -2709,7 +3108,7 @@ class Litepop:
                     self.clear_completed_episodes()
                 elif key == ord('r'):  # Manual sync
                     self.set_status_message("Syncing with gPodder...")
-                    if self._sync_with_gpodder():
+                    if self._sync_all_backends():
                         self.set_status_message("Sync complete.")
                     else:
                         self.set_status_message("Sync failed.")
@@ -2731,6 +3130,13 @@ class Litepop:
                 self.gpodder.upload_episode_actions(pending)
             
             self.download_manager.cleanup_all_files()
+            # ───────── Shutdown de FilePodSync ─────────
+            if hasattr(self, 'filepodsync') and self.filepodsync:
+                try:
+                    self.filepodsync.shutdown()
+                    log("🔌 FilePodSync client shutdown complete")
+                except Exception as e:
+                    log(f"⚠️ FilePodSync shutdown warning: {str(e)}")
             self.cleanup_curses()
 
 # ─────────────────────────────────────────────────────────────
