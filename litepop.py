@@ -98,7 +98,7 @@ try:
     FILEPODSYNC_AVAILABLE = True
     log("✅ FilePodSync library available")
 except ImportError:
-    log("⚠️ FilePodSync library NOT available - download it from https://github.com/racuna/FilePodSyc")
+    log("⚠️ FilePodSync library NOT available - download filepodsync.py from https://github.com/racuna/FilePodSyc")
 except Exception as e:
     log(f"⚠️ Error importing FilePodSync: {str(e)}")
 
@@ -2101,6 +2101,12 @@ class Litepop:
         """
         try:
             log("🔄 Starting multi-backend sync")
+            if self._use_filepodsync_for_progress and self.filepodsync.is_available():
+                try:
+                    self.filepodsync.sync(force=True)
+                    log("🔄 FilePodSync refreshed from shared folder")
+                except Exception as e:
+                    log(f"⚠️ FilePodSync pre-sync failed: {str(e)}")
             
             # ───────── 1. Subir acciones locales pendientes ─────────
             local_actions = self._get_pending_actions()
@@ -2170,6 +2176,15 @@ class Litepop:
                 fps_episodes = self.filepodsync.get_episodes()
                 self._update_episode_actions_cache_from_fps(fps_episodes)
                 log(f"📊 FilePodSync: {len(fps_episodes)} episodes synced")
+                # AÑADIR: también traer acciones de gPodder para capturar progreso de AntennaPod
+                if self.config.get_filepodsync_config()["enable_gpodder_fallback"] and self.gpodder:
+                    try:
+                        actions_data = self.gpodder.get_episode_actions(since=self.last_sync)
+                        if actions_data.get("actions"):
+                            self._update_episode_actions_cache(actions_data.get("actions", []))
+                            log(f"📊 gPodder fallback: {len(actions_data['actions'])} episode actions merged")
+                    except Exception as e:
+                        log(f"⚠️ gPodder episode actions fetch failed: {str(e)}")
             else:
                 # Fallback a gPodder
                 actions_data = self.gpodder.get_episode_actions()
@@ -2319,7 +2334,7 @@ class Litepop:
                 "total": total if total > 0 else -1,
                 "server_completed": fps_state == "completed" or progress >= 98.0,
                 "last_action": state_map.get(fps_state, "unknown"),
-                "last_timestamp": ep_data.get("updated_at", ""),
+                "last_timestamp": ep_data.get("updated_at", 0) / 1000,
                 "guid": ep_data.get("guid"),
                 "feed_url": ep_data.get("feed_url")
             })
@@ -2342,7 +2357,8 @@ class Litepop:
         # Update existing queue items with server status (LWW logic)
         for episode in self.queue:
             server_status = self._get_episode_server_status(episode.url)
-            server_ts = self.gpodder._parse_timestamp(server_status.get("last_timestamp", "")) if hasattr(self, 'gpodder') else 0.0
+            raw_ts = server_status.get("last_timestamp", 0)
+            server_ts = (float(raw_ts) if isinstance(raw_ts, (int, float)) else self.gpodder._parse_timestamp(str(raw_ts))) if hasattr(self, 'gpodder') else 0.0
             local_ts = getattr(episode, 'last_local_update', 0.0)
             
             # Si el servidor tiene datos más recientes que nuestra última modificación local,
