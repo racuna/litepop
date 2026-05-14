@@ -98,7 +98,7 @@ try:
     FILEPODSYNC_AVAILABLE = True
     log("✅ FilePodSync library available")
 except ImportError:
-    log("⚠️ FilePodSync library NOT available - install with: pip install filepodsync")
+    log("⚠️ FilePodSync library NOT available - download it from https://github.com/racuna/FilePodSyc")
 except Exception as e:
     log(f"⚠️ Error importing FilePodSync: {str(e)}")
 
