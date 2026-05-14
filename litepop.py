@@ -545,6 +545,71 @@ class GPodderSync:
             log(f"Error retrieving subscriptions: {str(e)}")
             return []
 
+    def upload_subscriptions(self, subscriptions: List[str]) -> bool:
+        """Upload subscription list to server (bidirectional sync)"""
+        try:
+            # Deduplicate and clean
+            clean_subs = list(dict.fromkeys([s.strip() for s in subscriptions if s and s.strip()]))
+            if not clean_subs:
+                return True
+
+            if self.backend == "nextcloud":
+                base = self.server_url.rstrip('/')
+                url = f"{base}/index.php/apps/gpoddersync/subscription_change/create"
+                
+                # Nextcloud gpoddersync espera cambios diferenciales
+                current_remote = self.get_subscriptions()
+                to_add = [s for s in clean_subs if s not in current_remote]
+                to_remove = [s for s in current_remote if s not in clean_subs]
+                
+                payload = {}
+                if to_add:
+                    payload["add"] = to_add
+                if to_remove:
+                    payload["remove"] = to_remove
+                
+                if not payload:
+                    log("No subscription changes to upload")
+                    return True
+                
+                resp = self.session.post(
+                    url,
+                    auth=(self.username, self.password),
+                    headers={"User-Agent": "litepop/1.0", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                log(f"✅ Uploaded {len(to_add)} added, {len(to_remove)} removed subscriptions to Nextcloud")
+                return True
+
+            elif self.backend in ("opodsync", "gpodder"):
+                # gPodder.net / opodsync: POST la lista completa de URLs
+                url = urljoin(
+                    self.server_url, 
+                    f"subscriptions/{self.username}/{self.device_id}.json"
+                )
+                resp = self.session.post(
+                    url,
+                    auth=(self.username, self.password),
+                    headers={"User-Agent": "litepop/1.0", "Content-Type": "application/json"},
+                    json=clean_subs,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                log(f"✅ Uploaded {len(clean_subs)} subscriptions to {self.backend}")
+                return True
+
+            else:
+                log(f"❌ Unknown backend for upload_subscriptions: {self.backend}")
+                return False
+
+        except Exception as e:
+            log(f"❌ Error uploading subscriptions: {str(e)}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
+            return False
+
     def get_episode_actions(self, since: Optional[datetime] = None) -> Dict:
         """Get episode actions from server with improved parsing"""
         try:
@@ -927,6 +992,28 @@ class GPodderSync:
                     
                     return {"error": str(e)}
             return {"error": str(e)}
+            
+    def _parse_timestamp(self, ts) -> float:
+        """Parsea cualquier formato de timestamp a Unix timestamp float"""
+        if not ts:
+            return 0.0
+        try:
+            if isinstance(ts, (int, float)):
+                return float(ts)
+            if isinstance(ts, str):
+                ts = ts.strip()
+                if 'T' in ts:
+                    # ISO 8601: 2024-01-15T10:30:00Z o con offset
+                    ts_clean = ts.replace('Z', '+00:00')
+                    # Quitar microsegundos si hay
+                    if '.' in ts_clean:
+                        ts_clean = ts_clean.split('.')[0] + ts_clean[ts_clean.find('+')-1:]
+                    return datetime.fromisoformat(ts_clean).timestamp()
+                if ts.isdigit():
+                    return float(ts)
+        except Exception as e:
+            log(f"⚠️ Error parsing timestamp '{ts}': {str(e)}")
+        return 0.0
 
 class FilePodSyncClient:
     """
@@ -1329,6 +1416,7 @@ class Episode:
         self.downloading = False
         self.progress = 0.0
         self.server_completed = False
+        self.last_local_update = 0.0  # Timestamp de última modificación local
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, Episode):
@@ -1825,6 +1913,8 @@ class Litepop:
                             log(f"⚠️ No podcast URL for {episode.title}, skipping sync")
                             time.sleep(30)
                             continue
+                            
+                        episode.last_local_update = time.time()
                         
                         # ───────── FilePodSync (primario) ─────────
                         if self._use_filepodsync_for_progress and self.filepodsync.is_available():
@@ -2030,33 +2120,49 @@ class Litepop:
                             title=""  # Podrías extraer título si lo necesitas
                         )
                 
-                # Fallback: gPodder si está habilitado
+                # Fallback: gPodder SIEMPRE si está habilitado, independientemente
+                # de quién sea el primario. AntennaPod necesita estos datos.
                 if (self.config.get_filepodsync_config()["enable_gpodder_fallback"] and 
-                    self.gpodder and 
-                    not self._use_filepodsync_for_progress):
-                    self.gpodder.upload_episode_actions(local_actions)
+                    self.gpodder):
+                    try:
+                        self.gpodder.upload_episode_actions(local_actions)
+                        log(f"📤 Uploaded {len(local_actions)} actions to gPodder fallback")
+                    except Exception as e:
+                        log(f"⚠️ gPodder fallback upload failed: {str(e)}")
             
             # ───────── 2. Sincronizar feeds (suscripciones) ─────────
+            # ESTRATEGIA: Merge de ambos backends. FilePodSync es primario,
+            # pero gPodder (Nextcloud/AntennaPod) siempre se consulta para no perder feeds.
+            
+            all_feed_urls = set()
+            
+            # 2a. Cargar desde FilePodSync (primario)
             if self._use_filepodsync_for_feeds and self.filepodsync.is_available():
-                # FilePodSync maneja feeds internamente
                 fps_feeds = self.filepodsync.get_feeds()
-                log(f"📚 FilePodSync: {len(fps_feeds)} feeds loaded")
-                
-                # Convertir a lista de URLs para compatibilidad con el resto del código
-                self.subscriptions = [PodcastFeed(url) for url in fps_feeds.keys()]
+                all_feed_urls.update(fps_feeds.keys())
+                log(f"📚 FilePodSync: {len(fps_feeds)} feeds")
+            
+            # 2b. SIEMPRE cargar desde gPodder fallback (para capturar feeds de AntennaPod)
+            if self.config.get_filepodsync_config()["enable_gpodder_fallback"] and self.gpodder:
+                try:
+                    gpodder_subs = self.gpodder.get_subscriptions()
+                    gpodder_subs = list(dict.fromkeys(gpodder_subs))
+                    all_feed_urls.update(gpodder_subs)
+                    log(f"📚 gPodder fallback: {len(gpodder_subs)} feeds")
+                except Exception as e:
+                    log(f"⚠️ gPodder feed sync failed: {str(e)}")
+            
+            # 2c. Crear objetos PodcastFeed para la unión
+            if all_feed_urls:
+                self.subscriptions = [PodcastFeed(url) for url in sorted(all_feed_urls)]
                 for feed in self.subscriptions:
-                    feed.fetch()  # Cargar episodios del RSS
-                    
-            else:
-                # Fallback a gPodder para obtener suscripciones
-                subscriptions = self.gpodder.get_subscriptions()
-                subscriptions = list(dict.fromkeys(subscriptions))  # Eliminar duplicados
-                
-                if subscriptions:
-                    self.subscriptions = [PodcastFeed(url) for url in subscriptions]
-                    for feed in self.subscriptions:
+                    try:
                         feed.fetch()
-                    log(f"📚 gPodder fallback: {len(subscriptions)} feeds loaded")
+                    except Exception as e:
+                        log(f"⚠️ Failed to fetch feed {feed.url}: {str(e)}")
+                log(f"📚 Total merged feeds: {len(self.subscriptions)}")
+            else:
+                log("⚠️ No feeds found in any backend")
             
             # ───────── 3. Sincronizar progreso de episodios ─────────
             if self._use_filepodsync_for_progress and self.filepodsync.is_available():
@@ -2093,7 +2199,7 @@ class Litepop:
             return False
 
     def _update_episode_actions_cache(self, actions: List[Dict]) -> None:
-        """Updates episode actions cache"""
+        """Updates episode actions cache with LWW (Last Write Wins) logic"""
         for action in actions:
             episode_url = action.get("episode")
             if not episode_url:
@@ -2107,28 +2213,37 @@ class Litepop:
                     "total": -1,
                     "server_completed": False,
                     "last_action": "unknown",
-                    "last_timestamp": ""
+                    "last_timestamp": "",
+                    "last_server_ts": 0.0,  # NUEVO: timestamp parseado del servidor
                 }
                 
             cache_entry = self.episode_actions_cache[episode_url]
             action_type = action.get("action", "").lower()
-            timestamp = action.get("timestamp", "")
+            raw_timestamp = action.get("timestamp", "")
             
-            # Update last action info
+            # NUEVO: Parsear timestamp del servidor
+            action_server_ts = self.gpodder._parse_timestamp(raw_timestamp) if hasattr(self, 'gpodder') else 0.0
+            
+            # NUEVO: LWW — solo actualizar si la acción del servidor es más reciente
+            # que la última que teníamos del servidor (ignoramos local por ahora,
+            # eso se maneja en _load_auto_queue con last_local_update)
+            if action_server_ts < cache_entry.get("last_server_ts", 0.0):
+                # Hay una acción más reciente ya en cache, ignorar esta antigua
+                continue
+            
+            cache_entry["last_server_ts"] = action_server_ts
             cache_entry["last_action"] = action_type
-            cache_entry["last_timestamp"] = timestamp
+            cache_entry["last_timestamp"] = raw_timestamp
             
             if action_type == "play":
                 position = int(action.get("position", 0))
                 total = int(action.get("total", -1))
                 
-                # Only update if we have valid data
                 if position > 0:
-                    cache_entry["position"] = max(cache_entry["position"], position)
+                    cache_entry["position"] = position
                     
                 if total > 0:
                     cache_entry["total"] = total
-                    # Calculate progress percentage
                     progress = (cache_entry["position"] / total) * 100
                     cache_entry["progress"] = min(progress, 100.0)
                     
@@ -2137,18 +2252,34 @@ class Litepop:
                         log(f"Episode marked as completed via progress: {episode_url} ({progress:.1f}%)")
                         
             elif action_type == "download":
-                # Download action means episode was explicitly downloaded
-                #cache_entry["server_completed"] = True
-                #cache_entry["progress"] = 100.0
-                log(f"Episode downloaded (not necessarily completed): {episode_url}")
+                # NUEVO: AntennaPod envía "download" cuando marcas como reproducido
+                # o cuando descarga explícitamente. Para progreso de reproducción,
+                # lo interpretamos como "completado" si no hay datos de posición.
+                # Si hay position/total en la acción, respetarlos.
+                position = int(action.get("position", 0))
+                total = int(action.get("total", -1))
+                
+                if position > 0 and total > 0:
+                    cache_entry["position"] = position
+                    cache_entry["total"] = total
+                    progress = (position / total) * 100
+                    cache_entry["progress"] = min(progress, 100.0)
+                    cache_entry["server_completed"] = progress >= 98.0
+                else:
+                    # Sin datos de posición: asumir completado (AntennaPod "mark as played")
+                    cache_entry["server_completed"] = True
+                    cache_entry["progress"] = 100.0
+                    if cache_entry["total"] > 0:
+                        cache_entry["position"] = cache_entry["total"]
+                
+                log(f"Episode action 'download' processed (completed={cache_entry['server_completed']}): {episode_url}")
                 
             log(f"Updated cache for {episode_url}: pos={cache_entry['position']}, progress={cache_entry['progress']:.1f}%, completed={cache_entry['server_completed']}")
             
         if len(self.episode_actions_cache) > self.max_cache_entries:
-            # Ordenar por timestamp y mantener solo las más recientes
             sorted_entries = sorted(
                 self.episode_actions_cache.items(),
-                key=lambda x: x[1].get("last_timestamp", ""),
+                key=lambda x: x[1].get("last_server_ts", 0.0),
                 reverse=True
             )
             self.episode_actions_cache = dict(sorted_entries[:self.max_cache_entries])
@@ -2208,15 +2339,27 @@ class Litepop:
         """Loads partially played episodes into queue"""
         log("Loading auto queue from episode actions")
         
-        # Update existing queue items with server status
+        # Update existing queue items with server status (LWW logic)
         for episode in self.queue:
             server_status = self._get_episode_server_status(episode.url)
-            # CORRECCIÓN: Solo marcar como completado si el progreso >= 98%
-            if server_status["progress"] >= 98.0:
-                episode.server_completed = True
+            server_ts = self.gpodder._parse_timestamp(server_status.get("last_timestamp", "")) if hasattr(self, 'gpodder') else 0.0
+            local_ts = getattr(episode, 'last_local_update', 0.0)
+            
+            # Si el servidor tiene datos más recientes que nuestra última modificación local,
+            # actualizamos la posición y estado desde el servidor.
+            if server_ts > local_ts:
+                episode.server_completed = server_status.get("server_completed", False)
+                episode.progress = server_status.get("progress", 0.0)
+                # Solo actualizar posición si el servidor tiene una real (no -1)
+                if server_status.get("position", 0) > 0:
+                    episode.position = server_status["position"]
+                log(f"🔄 Server wins for {episode.title}: server_ts={server_ts} > local_ts={local_ts}")
             else:
-                episode.server_completed = False
-            episode.position = max(episode.position, server_status["position"])
+                # Local es más reciente: mantener nuestra posición, pero sí reflejar
+                # si el servidor nos dice que está completado (eso es definitivo)
+                if server_status.get("server_completed", False) and not episode.completed:
+                    episode.server_completed = True
+                    episode.progress = 100.0
 
         # Find episodes to add to queue with more flexible criteria
         episodes_added = 0
@@ -2234,6 +2377,10 @@ class Litepop:
                 progress < 95.0 and
                 not any(ep.url == episode_url for ep in self.queue)
             )
+            # NUEVO: Si no cumple criterios de cola pero está completado,
+            # loguear para debug (no añadir a cola, está terminado)
+            if is_completed and not any(ep.url == episode_url for ep in self.queue):
+                log(f"Skipping completed episode from server: {episode_url}")
             
             if should_add:
                 # Find the episode in our feeds
@@ -2314,6 +2461,7 @@ class Litepop:
         episode.completed = True
         episode.progress = 100.0
         episode.server_completed = True
+        episode.last_local_update = time.time()
         
         # Determinar posición final para marcar como completado
         final_position = int(episode.duration * 0.99) if episode.duration and episode.duration > 0 else int(episode.position)
@@ -2752,6 +2900,7 @@ class Litepop:
         if self.player.play(episode):
             # Establecer posición inicial de sesión y duración si no está en el feed
             self.current_start_position = episode.position
+            episode.last_local_update = time.time()
             time.sleep(0.5)  # Espera breve para que mpv cargue metadata
             duration = self.player.get_duration()
             if duration > 0 and (not episode.duration or episode.duration <= 0):
@@ -2926,6 +3075,7 @@ class Litepop:
     def _sync_episode_position(self, episode: Episode) -> None:
         """Syncs episode position to gPodder"""
         if episode.position > 0:
+            episode.last_local_update = time.time()
             action = {
                 "podcast": episode.podcast_url or episode.podcast_title,
                 "episode": episode.url,
@@ -2937,6 +3087,47 @@ class Litepop:
                 "guid": episode.guid
             }
             self.gpodder.upload_episode_actions([action])
+
+    def add_subscription(self, url: str, title: str = "") -> bool:
+        """Añade un feed nuevo y lo sincroniza a ambos backends"""
+        url = url.strip()
+        if not url:
+            return False
+        
+        # Verificar si ya existe
+        if any(f.url == url for f in self.subscriptions):
+            self.set_status_message("Feed already subscribed.")
+            return False
+        
+        # 1. Añadir a FilePodSync si está activo
+        if self.filepodsync.is_available():
+            try:
+                self.filepodsync.add_feed(url, title)
+                log(f"✅ Feed added to FilePodSync: {url}")
+            except Exception as e:
+                log(f"⚠️ FilePodSync add_feed failed: {str(e)}")
+        
+        # 2. Subir a gPodder fallback (CRÍTICO para AntennaPod)
+        if self.config.get_filepodsync_config()["enable_gpodder_fallback"] and self.gpodder:
+            try:
+                current = self.gpodder.get_subscriptions()
+                if url not in current:
+                    current.append(url)
+                    self.gpodder.upload_subscriptions(current)
+                    log(f"📤 Feed uploaded to gPodder fallback: {url}")
+            except Exception as e:
+                log(f"⚠️ gPodder upload subscription failed: {str(e)}")
+        
+        # 3. Añadir localmente y fetch
+        feed = PodcastFeed(url)
+        if feed.fetch():
+            self.subscriptions.append(feed)
+            self.set_status_message(f"Subscribed: {feed.title}")
+            self.needs_refresh.set()
+            return True
+        else:
+            self.set_status_message(f"Failed to fetch feed: {url}")
+            return False
 
     def run(self) -> None:
         """Main application loop"""
