@@ -101,6 +101,18 @@ except ImportError:
     log("⚠️ FilePodSync library NOT available - download filepodsync.py from https://github.com/racuna/FilePodSyc")
 except Exception as e:
     log(f"⚠️ Error importing FilePodSync: {str(e)}")
+    
+# ─────────────────────────────────────────────────────────────
+# Evitar que los logs de FilePodSync rompan la terminal curses
+# ─────────────────────────────────────────────────────────────
+try:
+    import logging
+    _fps_logger = logging.getLogger("filepodsync")
+    for _h in _fps_logger.handlers[:]:
+        if isinstance(_h, logging.StreamHandler):
+            _fps_logger.removeHandler(_h)
+except Exception:
+    pass
 
 class Config:
     """Handles configuration file operations"""
@@ -1830,7 +1842,6 @@ class Litepop:
         self.threads = [
             threading.Thread(target=self._sync_worker, daemon=True),
             threading.Thread(target=self._playback_monitor, daemon=True),
-            threading.Thread(target=self._log_monitor, daemon=True),
             threading.Thread(target=self._position_sync_worker, daemon=True)
         ]
 
@@ -1863,18 +1874,6 @@ class Litepop:
             self.stdscr.keypad(False)
             curses.echo()
             curses.endwin()
-
-    def _log_monitor(self) -> None:
-        """Monitors log file for last line"""
-        log_file = Path(self.log_file)
-        while self.running:
-            try:
-                if log_file.exists():
-                    lines = log_file.read_text().splitlines()
-                    self.last_log_line = lines[-1].strip() if lines else ""
-                time.sleep(5.0)
-            except Exception:
-                time.sleep(5.0)
 
     def _position_sync_worker(self) -> None:
         """Syncs playback position to backends every 30 seconds"""
@@ -2688,15 +2687,6 @@ class Litepop:
                 for i, line in enumerate(help_lines):
                     try:
                         self.stdscr.addstr(help_row + i, 2, line[:width-4])
-                    except:
-                        pass
-                
-                # Log line
-                if self.last_log_line:
-                    try:
-                        self.stdscr.attron(curses.color_pair(7))
-                        self.stdscr.addstr(height - 2, 2, f"Log: {self.last_log_line}"[:width-4])
-                        self.stdscr.attroff(curses.color_pair(7))
                     except:
                         pass
                 
