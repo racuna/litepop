@@ -2267,25 +2267,18 @@ class Litepop:
                         log(f"Episode marked as completed via progress: {episode_url} ({progress:.1f}%)")
                         
             elif action_type == "download":
-                # NUEVO: AntennaPod envía "download" cuando marcas como reproducido
-                # o cuando descarga explícitamente. Para progreso de reproducción,
-                # lo interpretamos como "completado" si no hay datos de posición.
-                # Si hay position/total en la acción, respetarlos.
+                # CORRECCIÓN: "download" solo indica que el archivo se descargó al dispositivo.
+                # NO implica que se haya escuchado o completado.
+                # Solo actualizamos progreso si la acción incluye datos de posición/total válidos.
                 position = int(action.get("position", 0))
                 total = int(action.get("total", -1))
-                
                 if position > 0 and total > 0:
                     cache_entry["position"] = position
                     cache_entry["total"] = total
                     progress = (position / total) * 100
                     cache_entry["progress"] = min(progress, 100.0)
                     cache_entry["server_completed"] = progress >= 98.0
-                else:
-                    # Sin datos de posición: asumir completado (AntennaPod "mark as played")
-                    cache_entry["server_completed"] = True
-                    cache_entry["progress"] = 100.0
-                    if cache_entry["total"] > 0:
-                        cache_entry["position"] = cache_entry["total"]
+                # else: Ignorar para estado de reproducción. No marcar como completado.
                 
                 log(f"Episode action 'download' processed (completed={cache_entry['server_completed']}): {episode_url}")
                 
@@ -2453,8 +2446,10 @@ class Litepop:
                 actions.append({
                     "podcast": episode.podcast_url or episode.podcast_title,
                     "episode": episode.url,
-                    "action": "download",
+                    "action": "play",  # CORREGIDO: "play" con posición=total indica completado
                     "timestamp": get_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "position": int(episode.duration) if episode.duration else 0,
+                    "total": int(episode.duration) if episode.duration else 0,
                     "guid": episode.guid
                 })
             elif episode.position > 0 and episode != (self.queue[self.current_index] if 0 <= self.current_index < len(self.queue) else None):
