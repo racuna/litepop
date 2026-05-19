@@ -2369,6 +2369,23 @@ class Litepop:
                     episode.server_completed = True
                     episode.progress = 100.0
 
+        # ── NUEVO BLOQUE: Marcar como completados los episodios que Antennapod
+        #    marcó como terminados pero que YA están en la cola de litepop ──
+        for episode in self.queue:
+            if episode.completed:
+                continue  # Ya está marcado localmente, nada que hacer
+
+            server_status = self._get_episode_server_status(episode.url)
+            if server_status.get("server_completed", False):
+                log(f"🔄 Antennapod completó este episodio, sincronizando: {episode.title}")
+                episode.server_completed = True
+                episode.completed = True
+                episode.progress = 100.0
+                # Usar la posición del servidor si está disponible
+                server_pos = server_status.get("position", 0)
+                if server_pos > 0:
+                    episode.position = server_pos
+
         # Find episodes to add to queue with more flexible criteria
         episodes_added = 0
         for episode_url, cache_data in self.episode_actions_cache.items():
