@@ -129,4 +129,4 @@ GPL 3.0
 Contributions, feedback, and ideas are appreciated! Feel free to open a PR or issue.
 
 
-**Bitcoin Cash tips:** bitcoincash:qr5epnhfcg4qzrmtsgg7st8939afu87qsu54e6vp5r
+**Bitcoin Cash tips:** bitcoincash:qqhketnlpn2uqvyg0tl7vhasktwsum6s8ua3sxhg9e
