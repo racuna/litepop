@@ -1638,93 +1638,236 @@ class Player:
         """Creates unique IPC socket path"""
         return str(Path(tempfile.gettempdir()) / f"mpv_socket_{os.getpid()}_{int(time.time())}")
 
-    def _send_mpv_command(self, command: Dict) -> Optional[Dict]:
-        """Sends command to mpv via IPC socket"""
-        if not self.ipc_socket or not Path(self.ipc_socket).exists():
+    def _send_mpv_command(self, command: Dict, timeout: float = 2.0) -> Optional[Dict]:
+        """Sends command to mpv via IPC socket with request_id tracking"""
+        if not self.ipc_socket:
             return None
+        
+        socket_path = Path(self.ipc_socket)
+        if not socket_path.exists():
+            return None
+        
+        # Añadir ID único para identificar esta respuesta específica
+        request_id = int(time.time() * 1000000) % 1000000
+        command["request_id"] = request_id
+        
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(1)
+                sock.settimeout(timeout)
                 sock.connect(self.ipc_socket)
-                sock.sendall((json.dumps(command) + '\n').encode())
-                response = b''
-                while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
+                
+                cmd_json = json.dumps(command) + '\n'
+                sock.sendall(cmd_json.encode())
+                
+                deadline = time.time() + timeout
+                buffer = b''
+                
+                while time.time() < deadline:
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        
+                        # Procesar cada línea completa
+                        while b'\n' in buffer:
+                            line, buffer = buffer.split(b'\n', 1)
+                            line_str = line.decode('utf-8', errors='replace').strip()
+                            if not line_str:
+                                continue
+                            
+                            try:
+                                msg = json.loads(line_str)
+                            except json.JSONDecodeError:
+                                continue
+                            
+                            # ⭐ CLAVE: Solo devolver si es la respuesta a NUESTRO comando
+                            if msg.get("request_id") == request_id:
+                                return msg
+                            
+                            # Si es un evento de mpv, ignorarlo y seguir esperando
+                            if "event" in msg:
+                                pass
+                    
+                    except socket.timeout:
                         break
-                    response += chunk
-                    if b'\n' in chunk:
+                    except Exception:
                         break
-                response_str = response.decode().strip()
-                return json.loads(response_str.split('\n')[-1])
+                
+                return None
+                
+        except (ConnectionRefusedError, FileNotFoundError):
+            return None
         except Exception as e:
-            if "Connection refused" not in str(e):
-                log(f"IPC error: {str(e)}")
             return None
 
     def _monitor_position(self) -> None:
-        """Monitors playback position via IPC"""
+        """Monitors playback position via IPC with robust retry logic"""
+        max_retries = 30
+        retry_count = 0
+        
+        log(f"🔌 Monitor: esperando socket en {self.ipc_socket}")
+        while retry_count < max_retries:
+            if not self.playing:
+                log("🔌 Monitor: playback detenido antes de conectar")
+                return
+            
+            socket_path = Path(self.ipc_socket) if self.ipc_socket else None
+            if socket_path and socket_path.exists():
+                try:
+                    # Probar conexión real, no solo existencia del archivo
+                    test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    test_sock.settimeout(0.5)
+                    test_sock.connect(self.ipc_socket)
+                    test_sock.close()
+                    log(f"✅ IPC socket listo y conectable (intento {retry_count + 1})")
+                    break
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass
+                except Exception as e:
+                    log(f"⚠️ Test de conexión falló: {e}")
+            
+            time.sleep(0.5)
+            retry_count += 1
+        
+        if retry_count >= max_retries:
+            log(f"❌ Monitor: socket nunca estuvo listo tras {max_retries} intentos")
+            return
+        
+        consecutive_failures = 0
+        max_consecutive_failures = 20
+        
         while self.playing and self.process and self.process.poll() is None:
             try:
-                pos_response = self._send_mpv_command({"command": ["get_property", "time-pos"]})
+                pos_response = self._send_mpv_command(
+                    {"command": ["get_property", "time-pos"]},
+                    timeout=1.5
+                )
+                
                 if pos_response and pos_response.get("error") == "success":
-                    with self.position_lock:
-                        self.position = pos_response.get("data", 0.0)
-                        if self.current_episode:
-                            self.current_episode.position = self.position
-
-                if not self.duration or (self.current_episode and self.current_episode.duration != self.duration):
-                    dur_response = self._send_mpv_command({"command": ["get_property", "duration"]})
-                    if dur_response and dur_response.get("error") == "success":
+                    consecutive_failures = 0
+                    new_pos = pos_response.get("data", 0.0)
+                    if isinstance(new_pos, (int, float)):
                         with self.position_lock:
-                            self.duration = dur_response.get("data", 0.0)
+                            self.position = float(new_pos)
                             if self.current_episode:
-                                self.current_episode.duration = self.duration
+                                self.current_episode.position = self.position
+                        
+                        if not self.duration or self.duration <= 0:
+                            dur_response = self._send_mpv_command(
+                                {"command": ["get_property", "duration"]},
+                                timeout=1.5
+                            )
+                            if dur_response and dur_response.get("error") == "success":
+                                dur = dur_response.get("data", 0.0)
+                                if isinstance(dur, (int, float)) and dur > 0:
+                                    with self.position_lock:
+                                        self.duration = float(dur)
+                                        if self.current_episode:
+                                            self.current_episode.duration = self.duration
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                        log(f"⚠️ Monitor: fallo IPC #{consecutive_failures} (respuesta: {pos_response})")
+                    
+                    if consecutive_failures >= max_consecutive_failures:
+                        log(f"❌ Monitor: demasiados fallos consecutivos, deteniendo")
+                        break
+                
                 time.sleep(0.5)
+                
             except Exception as e:
-                log(f"Error monitoring position: {str(e)}")
-                break
+                log(f"⚠️ Monitor: excepción capturada (no muere): {type(e).__name__}: {e}")
+                consecutive_failures += 1
+                time.sleep(1)
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    log(f"❌ Monitor: abortando por demasiadas excepciones")
+                    break
+        
+        log(f"🔌 Monitor: thread terminado (playing={self.playing})")
 
     def play(self, episode: Episode) -> bool:
         """Plays specified episode"""
         if not episode.local_file or not Path(episode.local_file).exists():
             log(f"Error: file not found for playback: {episode.local_file}")
             return False
-
+        
+        # Detener reproducción anterior de forma limpia
         self.stop()
+        
         self.current_episode = episode
-        self.ipc_socket = self._create_ipc_socket()
+        new_ipc_socket = self._create_ipc_socket()
+        self.ipc_socket = new_ipc_socket
+        
         command = self.config.get("player", "player_command").format(
             speed=self.speed,
             file=episode.local_file,
             start_time=episode.position or 0,
-            ipc_socket=self.ipc_socket
+            ipc_socket=new_ipc_socket
         )
-
+        
         try:
             log(f"Starting playback: {episode.title} at position {episode.position}")
-            self.process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            log(f"IPC socket will be at: {new_ipc_socket}")
+            log(f"Command: {command}")
+            
+            # Crear el nuevo proceso
+            new_process = subprocess.Popen(
+                command, 
+                shell=True, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
+            
+            # Actualizar el estado global SOLO después de crear el proceso exitosamente
+            self.process = new_process
             self.playing = True
             self.duration = episode.duration or 0
             self.position = episode.position or 0
-            time.sleep(0.5)
-            self.position_monitor_thread = threading.Thread(target=self._monitor_position)
+            
+            # Iniciar monitor de posición
+            self.position_monitor_thread = threading.Thread(
+                target=self._monitor_position, 
+                name="mpv-monitor"
+            )
             self.position_monitor_thread.daemon = True
             self.position_monitor_thread.start()
-
-            def monitor_player():
-                proc = self.process  # Capturar referencia local
+            
+            # Hilo vigilante: DEBE capturar el proceso y socket específicos para evitar colisiones
+            def monitor_player(proc, sock):
                 if proc is None:
                     return
+                
+                # Esto se bloquea hasta que ESTE proceso específico termine
                 stdout, stderr = proc.communicate()
-                if proc and proc.returncode != 0:
-                    log(f"Error in mpv (code {proc.returncode}):\nSTDOUT: {stdout.decode('utf-8', errors='ignore')}\nSTDERR: {stderr.decode('utf-8', errors='ignore')}")
-                self.playing = False
-                if self.ipc_socket and Path(self.ipc_socket).exists():
-                    Path(self.ipc_socket).unlink(missing_ok=True)
-
-            threading.Thread(target=monitor_player, daemon=True).start()
+                
+                stderr_text = stderr.decode('utf-8', errors='ignore').strip()
+                if stderr_text:
+                    log(f"📺 mpv STDERR:\n{stderr_text[:1000]}")
+                
+                # CRÍTICO: Solo actualizar el estado global si este sigue siendo el proceso activo
+                if self.process is proc:
+                    if proc.returncode != 0:
+                        log(f"❌ mpv terminó con código {proc.returncode}")
+                    
+                    self.playing = False
+                    
+                    if sock and Path(sock).exists():
+                        try:
+                            Path(sock).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            
+            threading.Thread(
+                target=monitor_player, 
+                args=(new_process, new_ipc_socket), 
+                daemon=True, 
+                name="mpv-watcher"
+            ).start()
+            
             return True
+            
         except Exception as e:
             log(f"Error starting mpv: {str(e)}")
             return False
@@ -2213,13 +2356,14 @@ class Litepop:
             return False
 
     def _update_episode_actions_cache(self, actions: List[Dict]) -> None:
-        """Updates episode actions cache with LWW (Last Write Wins) logic"""
+        """Updates episode actions cache with strict LWW (Last Write Wins) logic.
+        Permite sobrescribir estados 'completados' si llega progreso más reciente."""
         for action in actions:
             episode_url = action.get("episode")
             if not episode_url:
                 continue
-                
-            # Initialize cache entry if doesn't exist
+
+            # Inicializar entrada en cache si no existe
             if episode_url not in self.episode_actions_cache:
                 self.episode_actions_cache[episode_url] = {
                     "progress": 0.0,
@@ -2228,61 +2372,64 @@ class Litepop:
                     "server_completed": False,
                     "last_action": "unknown",
                     "last_timestamp": "",
-                    "last_server_ts": 0.0,  # NUEVO: timestamp parseado del servidor
+                    "last_server_ts": 0.0,
                 }
-                
+
             cache_entry = self.episode_actions_cache[episode_url]
             action_type = action.get("action", "").lower()
             raw_timestamp = action.get("timestamp", "")
-            
-            # NUEVO: Parsear timestamp del servidor
+
+            # Parsear timestamp del servidor
             action_server_ts = self.gpodder._parse_timestamp(raw_timestamp) if hasattr(self, 'gpodder') else 0.0
-            
-            # NUEVO: LWW — solo actualizar si la acción del servidor es más reciente
-            # que la última que teníamos del servidor (ignoramos local por ahora,
-            # eso se maneja en _load_auto_queue con last_local_update)
+
+            # 🔹 LWW ESTRICTO: Solo procesar si la acción es MÁS NUEVA que la cacheada
             if action_server_ts < cache_entry.get("last_server_ts", 0.0):
-                # Hay una acción más reciente ya en cache, ignorar esta antigua
-                continue
-            
+                continue  # Ignorar acción antigua (evita retroceder progreso)
+
             cache_entry["last_server_ts"] = action_server_ts
             cache_entry["last_action"] = action_type
             cache_entry["last_timestamp"] = raw_timestamp
-            
-            if action_type == "play":
-                position = int(action.get("position", 0))
-                total = int(action.get("total", -1))
-                
-                if position > 0:
+
+            # Manejar acciones que reportan posición/progreso
+            if action_type in ("play", "download"):
+                # Extraer valores con validación robusta
+                raw_pos = action.get("position", 0)
+                raw_total = action.get("total", -1)
+
+                try:
+                    position = int(float(raw_pos)) if raw_pos is not None else 0
+                except (ValueError, TypeError):
+                    position = 0
+
+                try:
+                    total = int(float(raw_total)) if raw_total is not None else -1
+                except (ValueError, TypeError):
+                    total = -1
+
+                # Actualizar solo si son válidos
+                if position >= 0:
                     cache_entry["position"] = position
-                    
                 if total > 0:
                     cache_entry["total"] = total
-                    progress = (cache_entry["position"] / total) * 100
-                    cache_entry["progress"] = min(progress, 100.0)
-                    
-                    if progress >= 98.0:
-                        cache_entry["server_completed"] = True
-                        log(f"Episode marked as completed via progress: {episode_url} ({progress:.1f}%)")
-                        
-            elif action_type == "download":
-                # CORRECCIÓN: "download" solo indica que el archivo se descargó al dispositivo.
-                # NO implica que se haya escuchado o completado.
-                # Solo actualizamos progreso si la acción incluye datos de posición/total válidos.
-                position = int(action.get("position", 0))
-                total = int(action.get("total", -1))
-                if position > 0 and total > 0:
-                    cache_entry["position"] = position
-                    cache_entry["total"] = total
-                    progress = (position / total) * 100
-                    cache_entry["progress"] = min(progress, 100.0)
-                    cache_entry["server_completed"] = progress >= 98.0
-                # else: Ignorar para estado de reproducción. No marcar como completado.
-                
-                log(f"Episode action 'download' processed (completed={cache_entry['server_completed']}): {episode_url}")
-                
-            log(f"Updated cache for {episode_url}: pos={cache_entry['position']}, progress={cache_entry['progress']:.1f}%, completed={cache_entry['server_completed']}")
-            
+
+                # 📊 Calcular progreso de forma segura
+                progress = 0.0
+                if cache_entry["total"] > 0 and cache_entry["position"] >= 0:
+                    progress = min((cache_entry["position"] / cache_entry["total"]) * 100, 100.0)
+                elif cache_entry["position"] > 3600:
+                    # Fallback seguro: >1h sin duración conocida -> asumir completado
+                    progress = 100.0
+
+                cache_entry["progress"] = progress
+
+                # 🔑 CLAVE: Recalcular server_completed EN CADA ACTUALIZACIÓN
+                # Si el usuario vuelve a escuchar, progress < 98% -> server_completed = False
+                cache_entry["server_completed"] = (progress >= 98.0)
+
+            log(f"Cache updated: {episode_url[:50]}... | pos={cache_entry['position']}, "
+                f"prog={progress:.1f}%, completed={cache_entry['server_completed']}")
+
+        # Limpiar cache si excede límite
         if len(self.episode_actions_cache) > self.max_cache_entries:
             sorted_entries = sorted(
                 self.episode_actions_cache.items(),
@@ -2290,7 +2437,6 @@ class Litepop:
                 reverse=True
             )
             self.episode_actions_cache = dict(sorted_entries[:self.max_cache_entries])
-            log(f"Cache trimmed to {self.max_cache_entries} entries")
 
     def _update_episode_actions_cache_from_fps(self, fps_episodes: Dict[str, Dict]) -> None:
         """
